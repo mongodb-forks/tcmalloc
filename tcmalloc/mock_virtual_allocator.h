@@ -15,12 +15,15 @@
 #ifndef TCMALLOC_MOCK_VIRTUAL_ALLOCATOR_H_
 #define TCMALLOC_MOCK_VIRTUAL_ALLOCATOR_H_
 
+#include <cstddef>
 #include <vector>
 
 #include "absl/base/attributes.h"
 #include "tcmalloc/huge_allocator.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/system-alloc.h"
 
 namespace tcmalloc::tcmalloc_internal {
 
@@ -42,8 +45,8 @@ class FakeVirtualAllocator final : public VirtualAllocator {
 // Use a tiny fraction of actual size so we can test aggressively.
 inline AddressRange FakeVirtualAllocator::operator()(size_t bytes,
                                                      size_t align) {
-  CHECK_CONDITION(bytes % kHugePageSize == 0);
-  CHECK_CONDITION(align % kHugePageSize == 0);
+  TC_CHECK_EQ(bytes % kHugePageSize, 0);
+  TC_CHECK_EQ(align % kHugePageSize, 0);
   HugeLength req = HLFromBytes(bytes);
   huge_pages_requested_ += req;
   // Test the case where our sys allocator provides too much.

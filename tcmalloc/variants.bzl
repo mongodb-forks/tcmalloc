@@ -17,31 +17,32 @@
 build_variants = [
     {
         "name": "8k_pages",
-        "copts": [],
+        "copts": ["-DTCMALLOC_INTERNAL_8K_PAGES"],
     },
     {
         "name": "deprecated_perthread",
-        "copts": ["-DTCMALLOC_DEPRECATED_PERTHREAD"],
+        "copts": ["-DTCMALLOC_INTERNAL_8K_PAGES", "-DTCMALLOC_DEPRECATED_PERTHREAD"],
+        "visibility": ["//tcmalloc:tcmalloc_tests"],
     },
     {
         "name": "large_pages",
-        "copts": ["-DTCMALLOC_LARGE_PAGES"],
+        "copts": ["-DTCMALLOC_INTERNAL_32K_PAGES"],
     },
     {
         "name": "256k_pages",
-        "copts": ["-DTCMALLOC_256K_PAGES"],
-    },
-    {
-        "name": "256k_pages_and_numa",
-        "copts": ["-DTCMALLOC_256K_PAGES", "-DTCMALLOC_NUMA_AWARE"],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES"],
     },
     {
         "name": "small_but_slow",
-        "copts": ["-DTCMALLOC_SMALL_BUT_SLOW"],
+        "copts": ["-DTCMALLOC_INTERNAL_SMALL_BUT_SLOW"],
     },
     {
         "name": "numa_aware",
-        "copts": ["-DTCMALLOC_NUMA_AWARE"],
+        "copts": ["-DTCMALLOC_INTERNAL_8K_PAGES", "-DTCMALLOC_INTERNAL_NUMA_AWARE"],
+    },
+    {
+        "name": "256k_pages_numa_aware",
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES", "-DTCMALLOC_INTERNAL_NUMA_AWARE"],
     },
 ]
 
@@ -56,40 +57,21 @@ test_variants = [
         "name": "32k_pages",
         "malloc": "//tcmalloc:tcmalloc_large_pages",
         "deps": ["//tcmalloc:common_large_pages"],
-        "copts": ["-DTCMALLOC_LARGE_PAGES"],
+        "copts": ["-DTCMALLOC_INTERNAL_32K_PAGES"],
     },
     {
         "name": "256k_pages",
         "malloc": "//tcmalloc:tcmalloc_256k_pages",
         "deps": ["//tcmalloc:common_256k_pages"],
         "copts": [
-            "-DTCMALLOC_256K_PAGES",
+            "-DTCMALLOC_INTERNAL_256K_PAGES",
         ],
-    },
-    {
-        "name": "256k_pages_and_numa_disabled",
-        "malloc": "//tcmalloc:tcmalloc_256k_pages_and_numa",
-        "deps": ["//tcmalloc:common_256k_pages_and_numa"],
-        "copts": [
-            "-DTCMALLOC_256K_PAGES",
-            "-DTCMALLOC_NUMA_AWARE",
-        ],
-    },
-    {
-        "name": "256k_pages_and_numa_enabled",
-        "malloc": "//tcmalloc:tcmalloc_256k_pages_and_numa",
-        "deps": ["//tcmalloc:common_256k_pages_and_numa"],
-        "copts": [
-            "-DTCMALLOC_256K_PAGES",
-            "-DTCMALLOC_NUMA_AWARE",
-        ],
-        "env": {"TCMALLOC_NUMA_AWARE": "1"},
     },
     {
         "name": "small_but_slow",
         "malloc": "//tcmalloc:tcmalloc_small_but_slow",
         "deps": ["//tcmalloc:common_small_but_slow"],
-        "copts": ["-DTCMALLOC_SMALL_BUT_SLOW"],
+        "copts": ["-DTCMALLOC_INTERNAL_SMALL_BUT_SLOW"],
     },
     {
         "name": "256k_pages_pow2",
@@ -97,7 +79,7 @@ test_variants = [
         "deps": [
             "//tcmalloc:common_256k_pages",
         ],
-        "copts": ["-DTCMALLOC_256K_PAGES"],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES"],
         "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_SIZECLASS"},
     },
     {
@@ -106,7 +88,7 @@ test_variants = [
         "deps": [
             "//tcmalloc:common_256k_pages",
         ],
-        "copts": ["-DTCMALLOC_256K_PAGES"],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES"],
         "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_SHARDED_TRANSFER_CACHE"},
     },
     {
@@ -116,7 +98,35 @@ test_variants = [
             "//tcmalloc:common_numa_aware",
             "//tcmalloc:want_numa_aware",
         ],
-        "copts": ["-DTCMALLOC_NUMA_AWARE"],
+        "copts": ["-DTCMALLOC_INTERNAL_NUMA_AWARE"],
+    },
+    {
+        "name": "numa_aware_enabled_runtime",
+        "malloc": "//tcmalloc:tcmalloc_numa_aware",
+        "deps": [
+            "//tcmalloc:common_numa_aware",
+        ],
+        "copts": ["-DTCMALLOC_INTERNAL_NUMA_AWARE"],
+        "env": {"TCMALLOC_NUMA_AWARE": "1"},
+    },
+    {
+        "name": "numa_aware_disabled",
+        "malloc": "//tcmalloc:tcmalloc_numa_aware",
+        "deps": [
+            "//tcmalloc:common_numa_aware",
+            "//tcmalloc:want_numa_aware",
+        ],
+        "copts": ["-DTCMALLOC_INTERNAL_NUMA_AWARE"],
+        "env": {"TCMALLOC_NUMA_AWARE": "0"},
+    },
+    {
+        "name": "256k_pages_numa_aware",
+        "malloc": "//tcmalloc:tcmalloc_256k_pages_numa_aware",
+        "deps": [
+            "//tcmalloc:common_256k_pages_numa_aware",
+            "//tcmalloc:want_numa_aware",
+        ],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES", "-DTCMALLOC_INTERNAL_NUMA_AWARE"],
     },
     {
         "name": "256k_pages_pow2_sharded_transfer_cache",
@@ -124,7 +134,7 @@ test_variants = [
         "deps": [
             "//tcmalloc:common_256k_pages",
         ],
-        "copts": ["-DTCMALLOC_256K_PAGES"],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES"],
         "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_POW2_SIZECLASS,TEST_ONLY_TCMALLOC_SHARDED_TRANSFER_CACHE"},
     },
     {
@@ -137,24 +147,31 @@ test_variants = [
         "copts": [],
     },
     {
-        "name": "use_huge_region_more_often",
+        "name": "chunks_for_page_tracker_lists",
         "malloc": "//tcmalloc",
         "deps": ["//tcmalloc:common_8k_pages"],
-        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_USE_HUGE_REGIONS_MORE_OFTEN"},
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_FILLER_CHUNKS_PER_ALLOC"},
     },
     {
-        "name": "separate_allocs_for_few_and_many_objects_spans",
+        "name": "use_all_buckets_for_few_object_spans",
         "malloc": "//tcmalloc",
         "deps": ["//tcmalloc:common_8k_pages"],
-        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_SEPARATE_ALLOCS_FOR_FEW_AND_MANY_OBJECTS_SPANS"},
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_USE_ALL_BUCKETS_FOR_FEW_OBJECT_SPANS_IN_CFL"},
     },
     {
-        "name": "no_hpaa",
+        "name": "few_object_span_prioritization",
         "malloc": "//tcmalloc",
+        "deps": ["//tcmalloc:common_8k_pages"],
+        "env": {"BORG_EXPERIMENTS": "TCMALLOC_FEW_OBJECT_SPAN_PRIORITIZATION"},
+    },
+    {
+        "name": "32k_no_hpaa",
+        "malloc": "//tcmalloc:tcmalloc_large_pages",
         "deps": [
-            "//tcmalloc:common_8k_pages",
+            "//tcmalloc:common_large_pages",
             "//tcmalloc:want_no_hpaa",
         ],
+        "copts": ["-DTCMALLOC_INTERNAL_32K_PAGES"],
     },
     {
         "name": "hpaa",
@@ -163,6 +180,57 @@ test_variants = [
             "//tcmalloc:common_8k_pages",
             "//tcmalloc:want_hpaa",
         ],
+    },
+    {
+        "name": "deprecated_perthread",
+        "malloc": "//tcmalloc:tcmalloc_deprecated_perthread",
+        "copts": ["-DTCMALLOC_DEPRECATED_PERTHREAD"],
+        "deps": [
+            "//tcmalloc:common_deprecated_perthread",
+        ],
+    },
+    {
+        "name": "8k_lowfrag_sizeclasses",
+        "malloc": "//tcmalloc",
+        "deps": ["//tcmalloc:common_8k_pages"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_LOWFRAG_SIZECLASSES"},
+    },
+    {
+        "name": "32k_lowfrag_sizeclasses",
+        "malloc": "//tcmalloc:tcmalloc_large_pages",
+        "deps": ["//tcmalloc:common_large_pages"],
+        "copts": ["-DTCMALLOC_INTERNAL_32K_PAGES"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_LOWFRAG_SIZECLASSES"},
+    },
+    {
+        "name": "256k_lowfrag_sizeclasses",
+        "malloc": "//tcmalloc:tcmalloc_256k_pages",
+        "deps": ["//tcmalloc:common_256k_pages"],
+        "copts": ["-DTCMALLOC_INTERNAL_256K_PAGES"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_LOWFRAG_SIZECLASSES"},
+    },
+    {
+        "name": "small_but_slow_lowfrag_sizeclasses",
+        "malloc": "//tcmalloc:tcmalloc_small_but_slow",
+        "deps": ["//tcmalloc:common_small_but_slow"],
+        "copts": ["-DTCMALLOC_INTERNAL_SMALL_BUT_SLOW"],
+        "env": {"BORG_EXPERIMENTS": "TEST_ONLY_TCMALLOC_LOWFRAG_SIZECLASSES"},
+    },
+    {
+        "name": "flat_cpu_caches",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+        ],
+        "env": {"PERCPU_VCPU_MODE": "flat"},
+    },
+    {
+        "name": "real_cpu_caches",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common_8k_pages",
+        ],
+        "env": {"PERCPU_VCPU_MODE": "none"},
     },
 ]
 
@@ -240,12 +308,15 @@ def create_tcmalloc_test_variant_targets(create_one, name, srcs, **kwargs):
     deps = kwargs.pop("deps", [])
     linkopts = kwargs.pop("linkopts", [])
 
+    # Empty env var disables random experiments.
+    env0 = kwargs.pop("env", {"BORG_EXPERIMENTS": ""})
+
     variant_targets = []
     for variant in test_variants:
         inner_target_name = name + "_" + variant["name"]
         variant_targets.append(inner_target_name)
-        env = kwargs.pop("env", {})
-        env.update(variant.get("env", {}))
+        env = dict(variant.get("env", {}))
+        env.update(env0)
         create_one(
             inner_target_name,
             copts = copts + variant.get("copts", []),

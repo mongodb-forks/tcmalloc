@@ -27,10 +27,12 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/base/internal/spinlock.h"
+#include "tcmalloc/common.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/malloc_extension.h"
 #include "tcmalloc/page_allocator_test_util.h"
+#include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
 #include "tcmalloc/stats.h"
 
@@ -59,17 +61,17 @@ class PageAllocatorTest : public testing::Test {
     free(allocator_);
   }
 
-  Span* New(Length n, size_t objects_per_span,
+  Span* New(Length n, SpanAllocInfo span_alloc_info,
             MemoryTag tag = MemoryTag::kNormal) {
-    return allocator_->New(n, objects_per_span, tag);
+    return allocator_->New(n, span_alloc_info, tag);
   }
-  Span* NewAligned(Length n, Length align, size_t objects_per_span,
+  Span* NewAligned(Length n, Length align, SpanAllocInfo span_alloc_info,
                    MemoryTag tag = MemoryTag::kNormal) {
-    return allocator_->NewAligned(n, align, objects_per_span, tag);
+    return allocator_->NewAligned(n, align, span_alloc_info, tag);
   }
   void Delete(Span* s, size_t objects_per_span,
               MemoryTag tag = MemoryTag::kNormal) {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     allocator_->Delete(s, objects_per_span, tag);
   }
 
@@ -89,51 +91,54 @@ class PageAllocatorTest : public testing::Test {
 // We've already tested in stats_test that PageAllocInfo keeps good stats;
 // here we're just testing that we make the proper Record calls.
 TEST_F(PageAllocatorTest, Record) {
-  constexpr size_t kObjectsPerSpan = 7;
+  constexpr SpanAllocInfo kSpanInfo = {/*objects_per_span=*/7,
+                                       AccessDensityPrediction::kSparse};
   for (int i = 0; i < 15; ++i) {
-    Delete(New(Length(1), kObjectsPerSpan), kObjectsPerSpan);
+    Delete(New(Length(1), kSpanInfo), kSpanInfo.objects_per_span);
   }
 
   std::vector<Span*> spans;
   for (int i = 0; i < 20; ++i) {
-    spans.push_back(New(Length(2), kObjectsPerSpan));
+    spans.push_back(New(Length(2), kSpanInfo));
   }
 
   for (int i = 0; i < 25; ++i) {
-    Delete(NewAligned(Length(3), Length(2), kObjectsPerSpan), kObjectsPerSpan);
+    Delete(NewAligned(Length(3), Length(2), kSpanInfo),
+           kSpanInfo.objects_per_span);
   }
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     auto info = allocator_->info(MemoryTag::kNormal);
 
-    CHECK_CONDITION(15 == info.counts_for(Length(1)).nalloc);
-    CHECK_CONDITION(15 == info.counts_for(Length(1)).nfree);
+    ASSERT_EQ(15, info.counts_for(Length(1)).nalloc);
+    ASSERT_EQ(15, info.counts_for(Length(1)).nfree);
 
-    CHECK_CONDITION(20 == info.counts_for(Length(2)).nalloc);
-    CHECK_CONDITION(0 == info.counts_for(Length(2)).nfree);
+    ASSERT_EQ(20, info.counts_for(Length(2)).nalloc);
+    ASSERT_EQ(0, info.counts_for(Length(2)).nfree);
 
-    CHECK_CONDITION(25 == info.counts_for(Length(3)).nalloc);
-    CHECK_CONDITION(25 == info.counts_for(Length(3)).nfree);
+    ASSERT_EQ(25, info.counts_for(Length(3)).nalloc);
+    ASSERT_EQ(25, info.counts_for(Length(3)).nfree);
 
     for (auto i = Length(4); i <= kMaxPages; ++i) {
-      CHECK_CONDITION(0 == info.counts_for(i).nalloc);
-      CHECK_CONDITION(0 == info.counts_for(i).nfree);
+      ASSERT_EQ(0, info.counts_for(i).nalloc);
+      ASSERT_EQ(0, info.counts_for(i).nfree);
     }
 
     const Length absurd =
         Length(uintptr_t{1} << (kAddressBits - 1 - kPageShift));
     for (Length i = kMaxPages + Length(1); i < absurd; i *= 2) {
-      CHECK_CONDITION(0 == info.counts_for(i).nalloc);
-      CHECK_CONDITION(0 == info.counts_for(i).nfree);
+      ASSERT_EQ(0, info.counts_for(i).nalloc);
+      ASSERT_EQ(0, info.counts_for(i).nfree);
     }
   }
-  for (auto s : spans) Delete(s, kObjectsPerSpan);
+  for (auto s : spans) Delete(s, kSpanInfo.objects_per_span);
 }
 
 // And that we call the print method properly.
 TEST_F(PageAllocatorTest, PrintIt) {
-  constexpr size_t kObjectsPerSpan = 17;
-  Delete(New(Length(1), kObjectsPerSpan), kObjectsPerSpan);
+  constexpr SpanAllocInfo kSpanInfo = {/*objects_per_span=*/17,
+                                       AccessDensityPrediction::kDense};
+  Delete(New(Length(1), kSpanInfo), kSpanInfo.objects_per_span);
   std::string output = Print();
   EXPECT_THAT(output, testing::ContainsRegex("stats on allocation sizes"));
 }
@@ -142,12 +147,15 @@ TEST_F(PageAllocatorTest, ShrinkFailureTest) {
   // Turn off subrelease so that we take the ShrinkHardBy path.
   const bool old_subrelease = Parameters::hpaa_subrelease();
   Parameters::set_hpaa_subrelease(false);
-  Span* normal = New(kPagesPerHugePage / 2, 1, MemoryTag::kNormal);
-  Span* sampled = New(kPagesPerHugePage / 2, 1, MemoryTag::kSampled);
+
+  constexpr SpanAllocInfo kSpanInfo = {/*objects_per_span=*/1,
+                                       AccessDensityPrediction::kSparse};
+  Span* normal = New(kPagesPerHugePage / 2, kSpanInfo, MemoryTag::kNormal);
+  Span* sampled = New(kPagesPerHugePage / 2, kSpanInfo, MemoryTag::kSampled);
 
   BackingStats stats;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     stats = allocator_->stats();
   }
   EXPECT_EQ(stats.system_bytes, 2 * kHugePageSize);
@@ -155,16 +163,17 @@ TEST_F(PageAllocatorTest, ShrinkFailureTest) {
   EXPECT_EQ(stats.unmapped_bytes, 0);
 
   // Choose a limit so that we hit and we are not able to satisfy it.
-  allocator_->set_limit(kPagesPerHugePage.in_bytes(), false);
+  allocator_->set_limit(kPagesPerHugePage.in_bytes(), PageAllocator::kSoft);
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     allocator_->ShrinkToUsageLimit(Length(0));
   }
-  EXPECT_LE(1, allocator_->limit_hits());
-  EXPECT_LE(0, allocator_->successful_shrinks_after_limit_hit());
+  EXPECT_LE(1, allocator_->limit_hits(PageAllocator::kSoft));
+  EXPECT_LE(
+      0, allocator_->successful_shrinks_after_limit_hit(PageAllocator::kSoft));
 
-  Delete(normal, 1, MemoryTag::kNormal);
-  Delete(sampled, 1, MemoryTag::kSampled);
+  Delete(normal, kSpanInfo.objects_per_span, MemoryTag::kNormal);
+  Delete(sampled, kSpanInfo.objects_per_span, MemoryTag::kSampled);
   Parameters::set_hpaa_subrelease(old_subrelease);
 }
 
@@ -173,12 +182,14 @@ TEST_F(PageAllocatorTest, b270916852) {
   const bool old_subrelease = Parameters::hpaa_subrelease();
   Parameters::set_hpaa_subrelease(false);
 
-  Span* normal = New(kPagesPerHugePage / 2, 1, MemoryTag::kNormal);
-  Span* sampled = New(kPagesPerHugePage / 2, 1, MemoryTag::kSampled);
+  constexpr SpanAllocInfo kSpanInfo = {/*objects_per_span=*/1,
+                                       AccessDensityPrediction::kSparse};
+  Span* normal = New(kPagesPerHugePage / 2, kSpanInfo, MemoryTag::kNormal);
+  Span* sampled = New(kPagesPerHugePage / 2, kSpanInfo, MemoryTag::kSampled);
 
   BackingStats stats;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     stats = allocator_->stats();
   }
   EXPECT_EQ(stats.system_bytes, 2 * kHugePageSize);
@@ -190,21 +201,22 @@ TEST_F(PageAllocatorTest, b270916852) {
   // 2.  It is below current usage.
   // 3.  It is above what can be released from a single page heap.
   const size_t metadata_bytes = []() {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     return tc_globals.metadata_bytes();
   }();
   allocator_->set_limit(
       metadata_bytes + (3 * kPagesPerHugePage / 2).in_bytes() + kPageSize,
-      false);
+      PageAllocator::kSoft);
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     allocator_->ShrinkToUsageLimit(Length(0));
   }
-  EXPECT_LE(1, allocator_->limit_hits());
-  EXPECT_LE(1, allocator_->successful_shrinks_after_limit_hit());
+  EXPECT_LE(1, allocator_->limit_hits(PageAllocator::kSoft));
+  EXPECT_LE(
+      1, allocator_->successful_shrinks_after_limit_hit(PageAllocator::kSoft));
 
-  Delete(normal, 1, MemoryTag::kNormal);
-  Delete(sampled, 1, MemoryTag::kSampled);
+  Delete(normal, kSpanInfo.objects_per_span, MemoryTag::kNormal);
+  Delete(sampled, kSpanInfo.objects_per_span, MemoryTag::kSampled);
   Parameters::set_hpaa_subrelease(old_subrelease);
 }
 

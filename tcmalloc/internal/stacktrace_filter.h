@@ -16,74 +16,82 @@
 #define TCMALLOC_INTERNAL_STACKTRACE_FILTER_H_
 
 #include <atomic>
+#include <cstddef>
 
 #include "absl/hash/hash.h"
 #include "absl/types/span.h"
 #include "tcmalloc/internal/logging.h"
 
 namespace tcmalloc {
+
+class TcMallocTest;
+class GuardedAllocAlignmentTest;
+
 namespace tcmalloc_internal {
 
 // This class maintains a small collection of StackTrace hashes which are used
 // to inform the selection of allocations to be guarded. It provides two
 // functions:
-//    - Evaluate: returns a double with a value between 0.0 and 1.0.
-//      0.0 indicates no guards have been placed on this StackTrace.
-//      1.0 indicates this StackTrace is guarded more than any others.
-//      The closer the value is to 0.0, then less frequently the StackTrace has
-//      been guarded.
+//    - Count: returns the number of times the location has
+//      been Add-ed (represents guards placed on allocation from stack trace).
 //    - Add: which adds the provided StackTrace to the filter, for use when
-//      responding to subsequent Evaluate calls.
+//      responding to subsequent Count calls.
 // Based on the collection size (kSize), it uses the lower bits (kMask) of the
 // StackTrace hash as an index into stack_hashes_with_count_.  It stores a count
 // of the number of times a hash has been 'Add'-ed in the lower bits (kMask).
-//
-// To enhance selecting less frequent StackTrace hashes (stack traces), the most
-// frequently encountered StackTrace hash count is recorded as a high-water
-// mark. It is used within Evaluate to discourage guarding this high frequency
-// StackTrace hash.
 class StackTraceFilter {
  public:
   constexpr StackTraceFilter() = default;
 
-  double Evaluate(const StackTrace& stacktrace) const;
+  size_t Count(const StackTrace& stacktrace) const;
   void Add(const StackTrace& stacktrace);
+  size_t max_slots_used() const {
+    return max_slots_used_.load(std::memory_order_relaxed);
+  }
+  size_t replacement_inserts() const {
+    return replacement_inserts_.load(std::memory_order_relaxed);
+  }
+
+  // For Testing Only: expunge all counts, allowing for resetting the count,
+  // which allows the Improved Coverage algorithm to guard a specific stack
+  // trace more than kMaxGuardsPerStackTraceSignature times.
+  void Reset();
 
  private:
   constexpr static size_t kMask = 0xFF;
   constexpr static size_t kHashCountLimit = kMask;
   constexpr static int kSize = kMask + 1;
   std::atomic<size_t> stack_hashes_with_count_[kSize]{0};
-  std::atomic<size_t> most_frequent_hash_count_{1};
+  std::atomic<size_t> max_slots_used_{0};
+  std::atomic<size_t> replacement_inserts_{0};
 
   inline size_t HashOfStackTrace(const StackTrace& stacktrace) const {
     return absl::HashOf(
         absl::Span<void* const>(stacktrace.stack, stacktrace.depth));
   }
 
+  friend class GuardedPageAllocatorProfileTest;
   friend class StackTraceFilterTest;
   friend class StackTraceFilterThreadedTest;
+  friend class tcmalloc::TcMallocTest;
+  friend class tcmalloc::GuardedAllocAlignmentTest;
 };
 
-inline double StackTraceFilter::Evaluate(const StackTrace& stacktrace) const {
+inline size_t StackTraceFilter::Count(const StackTrace& stacktrace) const {
   size_t stack_hash = HashOfStackTrace(stacktrace);
   size_t existing_stack_hash_with_count =
       stack_hashes_with_count_[stack_hash % kSize].load(
           std::memory_order_relaxed);
   //  New stack trace
   if (existing_stack_hash_with_count == 0) {
-    return 0.0;
+    return 0;
   }
   // Different stack trace, treat as new
   if ((stack_hash & ~kMask) != (existing_stack_hash_with_count & ~kMask)) {
-    return 0.0;
+    return 0;
   }
   // Return a value based on the count of the most frequently guarded stack.
-  size_t most_frequent_hash_count =
-      most_frequent_hash_count_.load(std::memory_order_relaxed);
-  ASSERT(most_frequent_hash_count > 0);
-  return static_cast<double>(existing_stack_hash_with_count & kMask) /
-         most_frequent_hash_count;
+  return existing_stack_hash_with_count & kMask;
 }
 
 inline void StackTraceFilter::Add(const StackTrace& stacktrace) {
@@ -101,34 +109,21 @@ inline void StackTraceFilter::Add(const StackTrace& stacktrace) {
     }
     stack_hashes_with_count_[stack_hash % kSize].store(
         (stack_hash & ~kMask) | count, std::memory_order_relaxed);
-    // if more frequent, then raise limit
-    if (count > most_frequent_hash_count_.load(std::memory_order_relaxed)) {
-      most_frequent_hash_count_.store(count, std::memory_order_relaxed);
-    }
   } else {
+    if (existing_stack_hash_with_count == 0) {
+      max_slots_used_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      replacement_inserts_.fetch_add(1, std::memory_order_relaxed);
+    }
     // New stack_hash being placed in (unoccupied entry || existing entry)
     stack_hashes_with_count_[stack_hash % kSize].store(
         (stack_hash & ~kMask) | 1, std::memory_order_relaxed);
-    // For the case of replacing an existing entry, if it was the most
-    // frequently encountered stack_hash, find the remaining
-    // most frequent stack_hash count and store it.
-    if ((existing_stack_hash_with_count & kMask) >=
-        most_frequent_hash_count_.load(std::memory_order_relaxed)) {
-      // Search for highest value and use that.
-      size_t new_most_frequent_hash_count = 1;
-      std::atomic<size_t>* stack_hashes_with_count_ptr =
-          stack_hashes_with_count_;
-      for (int index = 0; index < kSize;
-           ++index, ++stack_hashes_with_count_ptr) {
-        count = stack_hashes_with_count_ptr->load(std::memory_order_relaxed) &
-                kMask;
-        if (count > new_most_frequent_hash_count) {
-          new_most_frequent_hash_count = count;
-        }
-      }
-      most_frequent_hash_count_.store(new_most_frequent_hash_count,
-                                      std::memory_order_relaxed);
-    }
+  }
+}
+
+inline void StackTraceFilter::Reset() {
+  for (size_t index = 0; index < kSize; ++index) {
+    stack_hashes_with_count_[index].store(0, std::memory_order_relaxed);
   }
 }
 

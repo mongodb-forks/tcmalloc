@@ -14,33 +14,20 @@
 
 #include "tcmalloc/guarded_page_allocator.h"
 
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
-
 #include <algorithm>
 #include <array>
 #include <memory>
-#include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "absl/base/attributes.h"
-#include "absl/base/casts.h"
-#include "absl/base/internal/spinlock.h"
-#include "absl/base/internal/sysinfo.h"
 #include "absl/container/flat_hash_set.h"
-#include "absl/memory/memory.h"
-#include "absl/numeric/bits.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #include "tcmalloc/common.h"
-#include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/page_size.h"
-#include "tcmalloc/malloc_extension.h"
+#include "tcmalloc/internal/sysinfo.h"
 #include "tcmalloc/static_vars.h"
+#include "tcmalloc/testing/testutil.h"
 
 namespace tcmalloc {
 namespace tcmalloc_internal {
@@ -58,13 +45,13 @@ static size_t PageSize() {
 class GuardedPageAllocatorTest : public testing::Test {
  protected:
   GuardedPageAllocatorTest() {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     gpa_.Init(kMaxGpaPages, kMaxGpaPages);
     gpa_.AllowAllocations();
   }
 
   explicit GuardedPageAllocatorTest(size_t num_pages) {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     gpa_.Init(num_pages, kMaxGpaPages);
     gpa_.AllowAllocations();
   }
@@ -184,7 +171,7 @@ TEST_F(GuardedPageAllocatorTest, PointerIsMine) {
   EXPECT_EQ(gpa_.SuccessfulAllocations(), 1);
   void* buf = alloc_with_status.alloc;
   int stack_var;
-  auto malloc_ptr = absl::make_unique<char>();
+  auto malloc_ptr = std::make_unique<char>();
   EXPECT_TRUE(gpa_.PointerIsMine(buf));
   EXPECT_FALSE(gpa_.PointerIsMine(&stack_var));
   EXPECT_FALSE(gpa_.PointerIsMine(malloc_ptr.get()));
@@ -231,7 +218,7 @@ TEST_F(GuardedPageAllocatorTest, ThreadedAllocCount) {
 // Test that allocator remains in consistent state under high contention and
 // doesn't double-allocate pages or fail to deallocate pages.
 TEST_F(GuardedPageAllocatorTest, ThreadedHighContention) {
-  const size_t kNumThreads = 4 * absl::base_internal::NumCPUs();
+  const size_t kNumThreads = 4 * NumCPUs();
   {
     std::vector<std::thread> threads;
     threads.reserve(kNumThreads);
@@ -274,6 +261,23 @@ TEST_F(GuardedPageAllocatorTest, ThreadedHighContention) {
               Profile::Sample::GuardedStatus::Guarded);
     EXPECT_NE(alloc_with_status.alloc, nullptr);
   }
+}
+
+TEST_F(GuardedPageAllocatorTest, DeleteSizeCheck) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "requires debug build";
+#endif
+  for (size_t i = 0; i < 1000; ++i) {
+    void* ptr = ::operator new(1000);
+    if (!tc_globals.guardedpage_allocator().PointerIsMine(ptr)) {
+      ::operator delete(ptr);
+      continue;
+    }
+    EXPECT_DEATH(sized_delete(ptr, 2000);, "size check failed 1000 2000");
+    ::operator delete(ptr);
+    return;
+  }
+  GTEST_SKIP() << "can't get a guarded allocation, giving up";
 }
 
 ABSL_CONST_INIT ABSL_ATTRIBUTE_UNUSED GuardedPageAllocator

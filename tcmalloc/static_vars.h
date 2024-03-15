@@ -31,19 +31,20 @@
 #include "tcmalloc/central_freelist.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/deallocation_profiler.h"
-#include "tcmalloc/explicitly_constructed.h"
 #include "tcmalloc/guarded_page_allocator.h"
 #include "tcmalloc/internal/atomic_stats_counter.h"
+#include "tcmalloc/internal/config.h"
+#include "tcmalloc/internal/explicitly_constructed.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/numa.h"
 #include "tcmalloc/internal/percpu.h"
-#include "tcmalloc/internal/stacktrace_filter.h"
+#include "tcmalloc/internal/sampled_allocation.h"
+#include "tcmalloc/internal/sampled_allocation_recorder.h"
 #include "tcmalloc/page_allocator.h"
 #include "tcmalloc/page_heap_allocator.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/peak_heap_tracker.h"
-#include "tcmalloc/sampled_allocation.h"
 #include "tcmalloc/sampled_allocation_allocator.h"
-#include "tcmalloc/sampled_allocation_recorder.h"
 #include "tcmalloc/sizemap.h"
 #include "tcmalloc/span.h"
 #include "tcmalloc/stack_trace_table.h"
@@ -60,6 +61,13 @@ class ThreadCache;
 using SampledAllocationRecorder =
     ::tcmalloc::tcmalloc_internal::SampleRecorder<SampledAllocation,
                                                   SampledAllocationAllocator>;
+
+enum class SizeClassConfiguration {
+  kPow2Below64 = 1,
+  kPow2Only = 2,
+  kLowFrag = 3,
+  kLegacy = 4,
+};
 
 class Static final {
  public:
@@ -111,8 +119,6 @@ class Static final {
     return guardedpage_allocator_;
   }
 
-  static StackTraceFilter& stacktrace_filter() { return stacktrace_filter_; }
-
   static SampledAllocationAllocator& sampledallocation_allocator() {
     return sampledallocation_allocator_;
   }
@@ -160,25 +166,8 @@ class Static final {
     cpu_cache_active_.store(true, std::memory_order_release);
   }
 
-  static bool ABSL_ATTRIBUTE_ALWAYS_INLINE IsOnFastPath() {
-    return
-        // These boolean operations do not require short-circuiting from &&.
-        // Bitwise AND of booleans triggers -Wbitwise-instead-of-logical, as
-        // this can be a common source of bugs.  Suppress this by casting to
-        // int first.
-
-#ifndef TCMALLOC_DEPRECATED_PERTHREAD
-        // When the per-cpu cache is enabled, and the thread's current cpu
-        // variable is initialized we will try to allocate from the per-cpu
-        // cache. If something fails, we bail out to the full malloc.
-        // Checking the current cpu variable here allows us to remove it from
-        // the fast-path, since we will fall back to the slow path until this
-        // variable is initialized.
-        static_cast<int>(CpuCacheActive()) &
-        static_cast<int>(subtle::percpu::IsFastNoInit());
-#else
-        !CpuCacheActive();
-#endif
+  static bool ABSL_ATTRIBUTE_ALWAYS_INLINE HaveHooks() {
+    return false;
   }
 
   static size_t metadata_bytes() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
@@ -186,6 +175,8 @@ class Static final {
   // The root of the pagemap is potentially a large poorly utilized
   // structure, so figure out how much of it is actually resident.
   static size_t pagemap_residence();
+
+  static SizeClassConfiguration size_class_configuration();
 
  private:
 #if defined(__clang__)
@@ -206,7 +197,6 @@ class Static final {
   ABSL_CONST_INIT static ShardedTransferCacheManager sharded_transfer_cache_;
   static CpuCache cpu_cache_;
   ABSL_CONST_INIT static GuardedPageAllocator guardedpage_allocator_;
-  ABSL_CONST_INIT static StackTraceFilter stacktrace_filter_;
   static SampledAllocationAllocator sampledallocation_allocator_;
   static PageHeapAllocator<Span> span_allocator_;
   static PageHeapAllocator<ThreadCache> threadcache_allocator_;

@@ -14,7 +14,6 @@
 
 #include "tcmalloc/internal/logging.h"
 
-#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,14 +21,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 
 #include "absl/base/attributes.h"
 #include "absl/base/const_init.h"
 #include "absl/base/internal/spinlock.h"
 #include "absl/base/macros.h"
 #include "absl/debugging/stacktrace.h"
+#include "absl/strings/string_view.h"
+#include "tcmalloc/internal/allocation_guard.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/parameter_accessors.h"
-#include "tcmalloc/malloc_extension.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -114,12 +117,9 @@ void Log(LogMode mode, const char* filename, int line, LogItem a, LogItem b,
 }
 
 ABSL_ATTRIBUTE_NOINLINE
-void Crash(CrashMode mode, const char* filename, int line, LogItem a, LogItem b,
-           LogItem c, LogItem d, LogItem e, LogItem f) {
-  Logger state = FormatLog(true, filename, line, a, b, c, d, e, f);
-
-  int msglen = state.p_ - state.buf_;
-
+ABSL_ATTRIBUTE_NORETURN
+static void Crash(CrashMode mode, const StackTrace& trace, const char* filename,
+                  int line, const char* msg, size_t msglen) {
   // FailureSignalHandler mallocs for various logging attempts.
   // We might be crashing holding tcmalloc locks.
   // We're substantially less likely to try to take those locks
@@ -132,14 +132,14 @@ void Crash(CrashMode mode, const char* filename, int line, LogItem a, LogItem b,
 
   bool first_crash = false;
   {
-    absl::base_internal::SpinLockHolder l(&crash_lock);
+    AllocationGuardSpinLockHolder l(&crash_lock);
     if (!crashed) {
       crashed = true;
       first_crash = true;
     }
   }
 
-  (*log_message_writer)(state.buf_, msglen);
+  (*log_message_writer)(msg, msglen);
   if (first_crash && mode == kCrashWithStats) {
 #ifndef __APPLE__
     if (&TCMalloc_Internal_GetStats != nullptr) {
@@ -152,6 +152,20 @@ void Crash(CrashMode mode, const char* filename, int line, LogItem a, LogItem b,
   abort();
 }
 
+ABSL_ATTRIBUTE_NOINLINE
+void Crash(CrashMode mode, const char* filename, int line, LogItem a, LogItem b,
+           LogItem c, LogItem d, LogItem e, LogItem f) {
+  Logger state = FormatLog(true, filename, line, a, b, c, d, e, f);
+  Crash(mode, state.trace, filename, line, state.buf_, state.p_ - state.buf_);
+}
+
+ABSL_ATTRIBUTE_NORETURN void CheckFailed(const char* file, int line,
+                                         const char* msg, int msglen) {
+  StackTrace trace;
+  trace.depth = absl::GetStackTrace(trace.stack, kMaxStackDepth, 1);
+  Crash(kCrash, trace, file, line, msg, msglen);
+}
+
 bool Logger::Add(const LogItem& item) {
   // Separate real items with spaces
   if (item.tag_ != LogItem::kEnd && p_ < end_) {
@@ -162,6 +176,11 @@ bool Logger::Add(const LogItem& item) {
   switch (item.tag_) {
     case LogItem::kStr:
       return AddStr(item.u_.str, strlen(item.u_.str));
+    case LogItem::kStrView: {
+      const absl::string_view* const sv_ptr =
+          static_cast<const absl::string_view* const>(item.u_.ptr);
+      return AddStr(sv_ptr->data(), sv_ptr->length());
+    }
     case LogItem::kUnsigned:
       return AddNum(item.u_.unum, 10);
     case LogItem::kSigned:

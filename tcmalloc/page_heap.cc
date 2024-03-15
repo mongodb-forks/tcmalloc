@@ -16,18 +16,21 @@
 
 #include <stddef.h>
 
-#include <limits>
-
+#include "absl/base/attributes.h"
 #include "absl/base/internal/cycleclock.h"
 #include "absl/base/internal/spinlock.h"
+#include "absl/base/optimization.h"
 #include "absl/numeric/bits.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/allocation_guard.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
-#include "tcmalloc/page_heap_allocator.h"
+#include "tcmalloc/page_allocator_interface.h"
 #include "tcmalloc/pagemap.h"
 #include "tcmalloc/pages.h"
-#include "tcmalloc/parameters.h"
+#include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
+#include "tcmalloc/stats.h"
 #include "tcmalloc/system-alloc.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -91,17 +94,16 @@ Span* PageHeap::AllocateSpan(Length n, bool* from_returned) {
   return result;
 }
 
-Span* PageHeap::New(Length n, size_t objects_per_span) {
+Span* PageHeap::New(Length n,
+                    SpanAllocInfo span_alloc_info ABSL_ATTRIBUTE_UNUSED) {
   ASSERT(n > Length(0));
   bool from_returned;
   Span* result;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     result = AllocateSpan(n, &from_returned);
     if (result) tc_globals.page_allocator().ShrinkToUsageLimit(n);
-    if (result)
-      info_.RecordAlloc(result->first_page(), result->num_pages(),
-                        objects_per_span);
+    if (result) info_.RecordAlloc(result->first_page(), result->num_pages());
   }
 
   if (result != nullptr && from_returned) {
@@ -132,18 +134,19 @@ static bool IsSpanBetter(Span* span, Span* best, Length n) {
 // unnecessary Carves in New) but it's not anywhere
 // close to a fast path, and is going to be replaced soon anyway, so
 // don't bother.
-Span* PageHeap::NewAligned(Length n, Length align, size_t objects_per_span) {
+Span* PageHeap::NewAligned(Length n, Length align,
+                           SpanAllocInfo span_alloc_info) {
   ASSERT(n > Length(0));
   ASSERT(absl::has_single_bit(align.raw_num()));
 
   if (align <= Length(1)) {
-    return New(n, objects_per_span);
+    return New(n, span_alloc_info);
   }
 
   bool from_returned;
   Span* span;
   {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     Length extra = align - Length(1);
     span = AllocateSpan(n + extra, &from_returned);
     if (span == nullptr) return nullptr;
@@ -153,7 +156,7 @@ Span* PageHeap::NewAligned(Length n, Length align, size_t objects_per_span) {
     const Length mask = align - Length(1);
     PageId aligned = PageId{(p.index() + mask.raw_num()) & ~mask.raw_num()};
     ASSERT(aligned.index() % align.raw_num() == 0);
-    ASSERT(p <= aligned);
+    TC_ASSERT_LE(p, aligned);
     ASSERT(aligned + n <= p + span->num_pages());
     // we have <extra> too many pages now, possible all before, possibly all
     // after, maybe both
@@ -179,7 +182,7 @@ Span* PageHeap::NewAligned(Length n, Length align, size_t objects_per_span) {
       MergeIntoFreeList(extra);
     }
 
-    info_.RecordAlloc(aligned, n, objects_per_span);
+    info_.RecordAlloc(aligned, n);
   }
 
   if (span != nullptr && from_returned) {
@@ -253,7 +256,6 @@ Span* PageHeap::Carve(Span* span, Length n) {
     leftover->set_location(old_location);
     RecordSpan(leftover);
     PrependToFreeList(leftover);  // Skip coalescing - no candidates possible
-    leftover->set_freelist_added_time(span->freelist_added_time());
     span->set_num_pages(n);
     pagemap_->Set(span->last_page(), span);
   }
@@ -263,9 +265,9 @@ Span* PageHeap::Carve(Span* span, Length n) {
 
 void PageHeap::Delete(Span* span, size_t objects_per_span) {
   ASSERT(GetMemoryTag(span->start_address()) == tag_);
-  info_.RecordFree(span->first_page(), span->num_pages(), objects_per_span);
+  info_.RecordFree(span->first_page(), span->num_pages());
   ASSERT(Check());
-  ASSERT(span->location() == Span::IN_USE);
+  TC_CHECK_EQ(span->location(), Span::IN_USE);
   ASSERT(!span->sampled());
   ASSERT(span->num_pages() > Length(0));
   ASSERT(pagemap_->GetDescriptor(span->first_page()) == span);
@@ -277,7 +279,6 @@ void PageHeap::Delete(Span* span, size_t objects_per_span) {
 
 void PageHeap::MergeIntoFreeList(Span* span) {
   ASSERT(span->location() != Span::IN_USE);
-  span->set_freelist_added_time(absl::base_internal::CycleClock::Now());
 
   // Coalesce -- we guarantee that "p" != 0, so no bounds checking
   // necessary.  We do not bother resetting the stale pagemap
@@ -293,7 +294,6 @@ void PageHeap::MergeIntoFreeList(Span* span) {
     // Merge preceding span into this span
     ASSERT(prev->last_page() + Length(1) == p);
     const Length len = prev->num_pages();
-    span->AverageFreelistAddedTime(prev);
     RemoveFromFreeList(prev);
     Span::Delete(prev);
     span->set_first_page(span->first_page() - len);
@@ -305,7 +305,6 @@ void PageHeap::MergeIntoFreeList(Span* span) {
     // Merge next span into this span
     ASSERT(next->first_page() == p + n);
     const Length len = next->num_pages();
-    span->AverageFreelistAddedTime(next);
     RemoveFromFreeList(next);
     Span::Delete(next);
     span->set_num_pages(span->num_pages() + len);
@@ -477,59 +476,23 @@ bool PageHeap::Check() {
 }
 
 void PageHeap::PrintInPbtxt(PbtxtRegion* region) {
-  absl::base_internal::SpinLockHolder h(&pageheap_lock);
+  PageHeapSpinLockHolder l;
   SmallSpanStats small;
   GetSmallSpanStats(&small);
   LargeSpanStats large;
   GetLargeSpanStats(&large);
 
-  struct Helper {
-    static void RecordAges(PageAgeHistograms* ages, const SpanListPair& pair) {
-      for (const Span* s : pair.normal) {
-        ages->RecordRange(s->num_pages(), false, s->freelist_added_time());
-      }
-
-      for (const Span* s : pair.returned) {
-        ages->RecordRange(s->num_pages(), true, s->freelist_added_time());
-      }
-    }
-  };
-
-  PageAgeHistograms ages(absl::base_internal::CycleClock::Now());
-  for (int s = 0; s < kMaxPages.raw_num(); ++s) {
-    Helper::RecordAges(&ages, free_[s]);
-  }
-  Helper::RecordAges(&ages, large_);
-  PrintStatsInPbtxt(region, small, large, ages);
+  PrintStatsInPbtxt(region, small, large);
   // We do not collect info_.PrintInPbtxt for now.
 }
 
 void PageHeap::Print(Printer* out) {
-  absl::base_internal::SpinLockHolder h(&pageheap_lock);
+  PageHeapSpinLockHolder l;
   SmallSpanStats small;
   GetSmallSpanStats(&small);
   LargeSpanStats large;
   GetLargeSpanStats(&large);
   PrintStats("PageHeap", out, stats_, small, large, true);
-
-  struct Helper {
-    static void RecordAges(PageAgeHistograms* ages, const SpanListPair& pair) {
-      for (const Span* s : pair.normal) {
-        ages->RecordRange(s->num_pages(), false, s->freelist_added_time());
-      }
-
-      for (const Span* s : pair.returned) {
-        ages->RecordRange(s->num_pages(), true, s->freelist_added_time());
-      }
-    }
-  };
-
-  PageAgeHistograms ages(absl::base_internal::CycleClock::Now());
-  for (int s = 0; s < kMaxPages.raw_num(); ++s) {
-    Helper::RecordAges(&ages, free_[s]);
-  }
-  Helper::RecordAges(&ages, large_);
-  ages.Print("PageHeap", out);
 
   info_.Print(out);
 }

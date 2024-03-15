@@ -24,10 +24,13 @@
 
 #include "gtest/gtest.h"
 #include "absl/base/internal/spinlock.h"
+#include "absl/base/optimization.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/random/random.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/static_vars.h"
 
 namespace tcmalloc {
@@ -42,7 +45,7 @@ class RawSpan {
     size_t objects_per_span = npages.in_bytes() / size;
 
     int res = posix_memalign(&mem_, kPageSize, npages.in_bytes());
-    CHECK_CONDITION(res == 0);
+    TC_CHECK_EQ(res, 0);
     span_.Init(PageIdContaining(mem_), npages);
     span_.BuildFreelist(size, objects_per_span, nullptr, 0);
   }
@@ -63,6 +66,7 @@ class SpanTest : public testing::TestWithParam<size_t> {
   size_t npages_;
   size_t batch_size_;
   size_t objects_per_span_;
+  uint32_t reciprocal_;
   RawSpan raw_span_;
 
  private:
@@ -76,6 +80,7 @@ class SpanTest : public testing::TestWithParam<size_t> {
     npages_ = tc_globals.sizemap().class_to_pages(size_class_);
     batch_size_ = tc_globals.sizemap().num_objects_to_move(size_class_);
     objects_per_span_ = npages_ * kPageSize / size_;
+    reciprocal_ = Span::CalcReciprocal(size_);
 
     raw_span_.Init(size_class_);
   }
@@ -128,7 +133,7 @@ TEST_P(SpanTest, FreelistBasic) {
     // Push all objects back except the last one (which would not be pushed).
     for (size_t idx = 0; idx < objects_per_span_ - 1; ++idx) {
       EXPECT_TRUE(objects[idx]);
-      bool ok = span_.FreelistPush(start + idx * size_, size_);
+      bool ok = span_.FreelistPush(start + idx * size_, size_, reciprocal_);
       EXPECT_TRUE(ok);
       EXPECT_FALSE(span_.FreelistEmpty(size_));
       objects[idx] = false;
@@ -136,8 +141,8 @@ TEST_P(SpanTest, FreelistBasic) {
     }
     // On the last iteration we can actually push the last object.
     if (x == 1) {
-      bool ok =
-          span_.FreelistPush(start + (objects_per_span_ - 1) * size_, size_);
+      bool ok = span_.FreelistPush(start + (objects_per_span_ - 1) * size_,
+                                   size_, reciprocal_);
       EXPECT_FALSE(ok);
     }
   }
@@ -155,7 +160,7 @@ TEST_P(SpanTest, FreelistRandomized) {
   for (size_t x = 0; x < 10000; ++x) {
     if (!objects.empty() && absl::Bernoulli(rng, 1.0 / 2)) {
       void* p = *objects.begin();
-      if (span_.FreelistPush(p, size_)) {
+      if (span_.FreelistPush(p, size_, reciprocal_)) {
         objects.erase(objects.begin());
       } else {
         EXPECT_EQ(objects.size(), 1);
@@ -192,6 +197,45 @@ TEST_P(SpanTest, FreelistRandomized) {
 }
 
 INSTANTIATE_TEST_SUITE_P(All, SpanTest, testing::Range(size_t(1), kNumClasses));
+
+TEST(SpanAllocatorTest, Alignment) {
+  PageId p{1};
+  Length len{2};
+
+  constexpr int kNumSpans = 1000;
+  std::vector<Span*> spans;
+  spans.reserve(kNumSpans);
+
+  {
+    PageHeapSpinLockHolder l;
+    for (int i = 0; i < kNumSpans; ++i) {
+      spans.push_back(Span::New(p, len));
+    }
+  }
+
+  absl::flat_hash_map<uintptr_t, int> address_mod_cacheline;
+  for (Span* s : spans) {
+    ++address_mod_cacheline[reinterpret_cast<uintptr_t>(s) %
+                            ABSL_CACHELINE_SIZE];
+  }
+
+  // Not all spans are currently aligned to a cacheline.
+  //
+  // TODO(b/304135905): Modify this assumption.
+  EXPECT_LT(address_mod_cacheline[0], kNumSpans);
+
+  // Verify alignof is respected.
+  for (auto [alignment, count] : address_mod_cacheline) {
+    EXPECT_EQ(alignment % alignof(Span), 0);
+  }
+
+  {
+    PageHeapSpinLockHolder l;
+    for (Span* s : spans) {
+      Span::Delete(s);
+    }
+  }
+}
 
 }  // namespace
 }  // namespace tcmalloc_internal

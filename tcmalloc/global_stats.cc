@@ -14,34 +14,45 @@
 
 #include "tcmalloc/global_stats.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
 #include "absl/strings/match.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
+#include "absl/time/time.h"
+#include "absl/types/optional.h"
 #include "tcmalloc/central_freelist.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/cpu_cache.h"
 #include "tcmalloc/experiment.h"
+#include "tcmalloc/experiment_config.h"
 #include "tcmalloc/guarded_page_allocator.h"
+#include "tcmalloc/internal/allocation_guard.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/memory_stats.h"
+#include "tcmalloc/internal/optimization.h"
+#include "tcmalloc/internal/percpu.h"
 #include "tcmalloc/page_allocator.h"
-#include "tcmalloc/page_heap.h"
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/pagemap.h"
-#include "tcmalloc/pages.h"
 #include "tcmalloc/parameters.h"
-#include "tcmalloc/sampled_allocation.h"
-#include "tcmalloc/sampler.h"
 #include "tcmalloc/span.h"
+#include "tcmalloc/span_stats.h"
+#include "tcmalloc/stack_trace_table.h"
 #include "tcmalloc/static_vars.h"
 #include "tcmalloc/stats.h"
 #include "tcmalloc/system-alloc.h"
 #include "tcmalloc/thread_cache.h"
 #include "tcmalloc/transfer_cache.h"
-#include "tcmalloc/transfer_cache_stats.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
+
+using subtle::percpu::RseqVcpuMode;
 
 // Get stats into "r".  Also, if class_count != NULL, class_count[k]
 // will be set to the total number of objects of size class k in the
@@ -58,6 +69,8 @@ void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   for (int size_class = 0; size_class < kNumClasses; ++size_class) {
     const size_t length = tc_globals.central_freelist(size_class).length();
     const size_t tc_length = tc_globals.transfer_cache().tc_length(size_class);
+    const size_t sharded_tc_length =
+        tc_globals.sharded_transfer_cache().TotalObjectsOfClass(size_class);
     const size_t cache_overhead =
         tc_globals.central_freelist(size_class).OverheadBytes();
     const size_t size = tc_globals.sizemap().class_to_size(size_class);
@@ -66,7 +79,7 @@ void ExtractStats(TCMallocStats* r, uint64_t* class_count,
     if (class_count) {
       // Sum the lengths of all per-class freelists, except the per-thread
       // freelists, which get counted when we call GetThreadStats(), below.
-      class_count[size_class] = length + tc_length;
+      class_count[size_class] = length + tc_length + sharded_tc_length;
       if (UsePerCpuCache(tc_globals)) {
         class_count[size_class] +=
             tc_globals.cpu_cache().TotalObjectsOfClass(size_class);
@@ -81,9 +94,8 @@ void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   // Add stats from per-thread heaps
   r->thread_bytes = 0;
   {  // scope
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
-    ThreadCache::GetThreadStats(&r->thread_bytes, class_count);
-    r->tc_stats = ThreadCache::HeapStats();
+    PageHeapSpinLockHolder l;
+    r->tc_stats = ThreadCache::GetStats(&r->thread_bytes, class_count);
     r->span_stats = tc_globals.span_allocator().stats();
     r->stack_stats = tc_globals.sampledallocation_allocator().stats();
     r->linked_sample_stats = tc_globals.linked_sample_allocator().stats();
@@ -109,7 +121,7 @@ void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   if (report_residence) {
     auto resident_bytes = tc_globals.pagemap_residence();
     r->pagemap_root_bytes_res = resident_bytes;
-    ASSERT(r->metadata_bytes >= r->pagemap_bytes);
+    TC_ASSERT_GE(r->metadata_bytes, r->pagemap_bytes);
     r->metadata_bytes = r->metadata_bytes - r->pagemap_bytes + resident_bytes;
   } else {
     r->pagemap_root_bytes_res = 0;
@@ -129,7 +141,7 @@ void ExtractStats(TCMallocStats* r, uint64_t* class_count,
       r->percpu_metadata_bytes_res = percpu_metadata.resident_size;
       r->percpu_metadata_bytes = percpu_metadata.virtual_size;
 
-      ASSERT(r->metadata_bytes >= r->percpu_metadata_bytes);
+      TC_ASSERT_GE(r->metadata_bytes, r->percpu_metadata_bytes);
       r->metadata_bytes = r->metadata_bytes - r->percpu_metadata_bytes +
                           r->percpu_metadata_bytes_res;
     }
@@ -205,6 +217,34 @@ static int CountAllowedCpus() {
   return CPU_COUNT(&allowed_cpus);
 }
 
+static absl::string_view SizeClassConfigurationString(
+    SizeClassConfiguration config) {
+  switch (config) {
+    case SizeClassConfiguration::kPow2Below64:
+      return "SIZE_CLASS_POW2_BELOW_64";
+    case SizeClassConfiguration::kPow2Only:
+      return "SIZE_CLASS_POW2_ONLY";
+    case SizeClassConfiguration::kLowFrag:
+      return "SIZE_CLASS_LOW_FRAG";
+    case SizeClassConfiguration::kLegacy:
+      // TODO(b/242710633): remove this opt out.
+      return "SIZE_CLASS_LEGACY";
+  }
+
+  ASSUME(false);
+  return "SIZE_CLASS_UNKNOWN";
+}
+
+static absl::string_view PerCpuTypeString(RseqVcpuMode mode) {
+  switch (mode) {
+    case RseqVcpuMode::kNone:
+      return "NONE";
+  }
+
+  ASSUME(false);
+  return "NONE";
+}
+
 void DumpStats(Printer* out, int level) {
   TCMallocStats stats;
   uint64_t class_count[kNumClasses];
@@ -226,7 +266,7 @@ void DumpStats(Printer* out, int level) {
   const uint64_t unmapped_bytes = UnmappedBytes(stats);
   const uint64_t bytes_in_use_by_app = InUseByApp(stats);
 
-#ifdef TCMALLOC_SMALL_BUT_SLOW
+#ifdef TCMALLOC_INTERNAL_SMALL_BUT_SLOW
   out->printf("NOTE:  SMALL MEMORY MODEL IS IN USE, PERFORMANCE MAY SUFFER.\n");
 #endif
   // clang-format off
@@ -376,7 +416,7 @@ void DumpStats(Printer* out, int level) {
           span_stats[size_class].prob_returned());
     }
 
-#ifndef TCMALLOC_SMALL_BUT_SLOW
+#ifndef TCMALLOC_INTERNAL_SMALL_BUT_SLOW
     out->printf("------------------------------------------------\n");
     out->printf("Central cache freelist: Span utilization histogram\n");
     out->printf("Non-cumulative number of spans with allocated objects < N\n");
@@ -401,17 +441,22 @@ void DumpStats(Printer* out, int level) {
     tc_globals.page_allocator().Print(out, MemoryTag::kCold);
     tc_globals.guardedpage_allocator().Print(out);
 
-    uint64_t limit_bytes;
-    bool is_hard;
-    std::tie(limit_bytes, is_hard) = tc_globals.page_allocator().limit();
-    out->printf("PARAMETER desired_usage_limit_bytes %u %s\n", limit_bytes,
-                is_hard ? "(hard)" : "");
-    out->printf("Number of times limit was hit: %lld\n",
-                tc_globals.page_allocator().limit_hits());
-    out->printf(
-        "Number of times memory shrank below limit: %lld\n",
-        tc_globals.page_allocator().successful_shrinks_after_limit_hit());
-
+    uint64_t soft_limit_bytes =
+        tc_globals.page_allocator().limit(PageAllocator::kSoft);
+    uint64_t hard_limit_bytes =
+        tc_globals.page_allocator().limit(PageAllocator::kHard);
+    out->printf("PARAMETER desired_usage_limit_bytes %u\n", soft_limit_bytes);
+    out->printf("PARAMETER hard_usage_limit_bytes %u\n", hard_limit_bytes);
+    out->printf("Number of times soft limit was hit: %lld\n",
+                tc_globals.page_allocator().limit_hits(PageAllocator::kSoft));
+    out->printf("Number of times hard limit was hit: %lld\n",
+                tc_globals.page_allocator().limit_hits(PageAllocator::kHard));
+    out->printf("Number of times memory shrank below soft limit: %lld\n",
+                tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+                    PageAllocator::kSoft));
+    out->printf("Number of times memory shrank below hard limit: %lld\n",
+                tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+                    PageAllocator::kHard));
     out->printf("PARAMETER tcmalloc_per_cpu_caches %d\n",
                 Parameters::per_cpu_caches() ? 1 : 0);
     out->printf("PARAMETER tcmalloc_max_per_cpu_cache_size %d\n",
@@ -431,16 +476,31 @@ void DumpStats(Printer* out, int level) {
                     Parameters::filler_skip_subrelease_long_interval()));
     out->printf("PARAMETER tcmalloc_release_partial_alloc_pages %d\n",
                 Parameters::release_partial_alloc_pages() ? 1 : 0);
+    out->printf("PARAMETER tcmalloc_huge_region_demand_based_release %d\n",
+                Parameters::huge_region_demand_based_release() ? 1 : 0);
+    out->printf("PARAMETER tcmalloc_release_pages_from_huge_region %d\n",
+                Parameters::release_pages_from_huge_region() ? 1 : 0);
     out->printf("PARAMETER flat vcpus %d\n",
                 subtle::percpu::UsingFlatVirtualCpus() ? 1 : 0);
-    out->printf("PARAMETER tcmalloc_shuffle_per_cpu_caches %d\n",
-                Parameters::shuffle_per_cpu_caches() ? 1 : 0);
-    out->printf("PARAMETER tcmalloc_partial_transfer_cache %d\n",
-                Parameters::partial_transfer_cache() ? 1 : 0);
     out->printf(
         "PARAMETER tcmalloc_separate_allocs_for_few_and_many_objects_spans "
         "%d\n",
         Parameters::separate_allocs_for_few_and_many_objects_spans());
+    out->printf("PARAMETER tcmalloc_filler_chunks_per_alloc %d\n",
+                Parameters::chunks_per_alloc());
+    out->printf("PARAMETER tcmalloc_use_wider_slabs %d\n",
+                tc_globals.cpu_cache().UseWiderSlabs() ? 1 : 0);
+    out->printf("PARAMETER tcmalloc_configure_size_class_max_capacity %d\n",
+                tc_globals.cpu_cache().ConfigureSizeClassMaxCapacity() ? 1 : 0);
+    out->printf(
+        "PARAMETER tcmalloc_use_all_buckets_for_few_object_spans %d\n",
+        Parameters::use_all_buckets_for_few_object_spans_in_cfl() ? 1 : 0);
+
+    out->printf(
+        "PARAMETER size_class_config %s\n",
+        SizeClassConfigurationString(tc_globals.size_class_configuration()));
+    out->printf("PARAMETER percpu_vcpu_type %s\n",
+                PerCpuTypeString(subtle::percpu::GetRseqVcpuMode()));
   }
 }
 
@@ -522,7 +582,7 @@ void DumpStatsInPbtxt(Printer* out, int level) {
 
   if (level >= 2) {
     {
-#ifndef TCMALLOC_SMALL_BUT_SLOW
+#ifndef TCMALLOC_INTERNAL_SMALL_BUT_SLOW
       for (int size_class = 1; size_class < kNumClasses; ++size_class) {
         uint64_t class_bytes = class_count[size_class] *
                                tc_globals.sizemap().class_to_size(size_class);
@@ -544,10 +604,6 @@ void DumpStatsInPbtxt(Printer* out, int level) {
     tc_globals.transfer_cache().PrintInPbtxt(&region);
     tc_globals.sharded_transfer_cache().PrintInPbtxt(&region);
 
-    region.PrintRaw("transfer_cache_implementation",
-                    TransferCacheImplementationToLabel(
-                        tc_globals.transfer_cache().implementation()));
-
     if (UsePerCpuCache(tc_globals)) {
       tc_globals.cpu_cache().PrintInPbtxt(&region);
     }
@@ -560,16 +616,25 @@ void DumpStatsInPbtxt(Printer* out, int level) {
   tc_globals.page_allocator().PrintInPbtxt(&region, MemoryTag::kCold);
   // We do not collect tracking information in pbtxt.
 
-  size_t limit_bytes;
-  bool is_hard;
-  std::tie(limit_bytes, is_hard) = tc_globals.page_allocator().limit();
-  region.PrintI64("desired_usage_limit_bytes", limit_bytes);
-  region.PrintBool("hard_limit", is_hard);
-  region.PrintI64("limit_hits", tc_globals.page_allocator().limit_hits());
-  region.PrintI64(
-      "successful_shrinks_after_limit_hit",
-      tc_globals.page_allocator().successful_shrinks_after_limit_hit());
+  size_t soft_limit_bytes =
+      tc_globals.page_allocator().limit(PageAllocator::kSoft);
+  size_t hard_limit_bytes =
+      tc_globals.page_allocator().limit(PageAllocator::kHard);
 
+  region.PrintI64("desired_usage_limit_bytes", soft_limit_bytes);
+  region.PrintI64("hard_usage_limit_bytes", hard_limit_bytes);
+  region.PrintI64("soft_limit_hits",
+                  tc_globals.page_allocator().limit_hits(PageAllocator::kSoft));
+  region.PrintI64("hard_limit_hits",
+                  tc_globals.page_allocator().limit_hits(PageAllocator::kHard));
+  region.PrintI64(
+      "successful_shrinks_after_soft_limit_hit",
+      tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+          PageAllocator::kSoft));
+  region.PrintI64(
+      "successful_shrinks_after_hard_limit_hit",
+      tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+          PageAllocator::kHard));
   {
     auto gwp_asan = region.CreateSubRegion("gwp_asan");
     tc_globals.guardedpage_allocator().PrintInPbtxt(&gwp_asan);
@@ -595,22 +660,34 @@ void DumpStatsInPbtxt(Printer* out, int level) {
                       Parameters::filler_skip_subrelease_long_interval()));
   region.PrintBool("tcmalloc_release_partial_alloc_pages",
                    Parameters::release_partial_alloc_pages());
-  region.PrintBool("tcmalloc_shuffle_per_cpu_caches",
-                   Parameters::shuffle_per_cpu_caches());
+  region.PrintBool("tcmalloc_huge_region_demand_based_release",
+                   Parameters::huge_region_demand_based_release());
+  region.PrintBool("tcmalloc_release_pages_from_huge_region",
+                   Parameters::release_pages_from_huge_region());
   region.PrintI64("profile_sampling_rate", Parameters::profile_sampling_rate());
   region.PrintRaw("percpu_vcpu_type",
-                  subtle::percpu::UsingFlatVirtualCpus() ? "FLAT" : "NONE");
-  region.PrintBool("tcmalloc_partial_transfer_cache",
-                   Parameters::partial_transfer_cache());
+                  PerCpuTypeString(subtle::percpu::GetRseqVcpuMode()));
   region.PrintI64("separate_allocs_for_few_and_many_objects_spans",
                   Parameters::separate_allocs_for_few_and_many_objects_spans());
+  region.PrintI64("tcmalloc_filler_chunks_per_alloc",
+                  Parameters::chunks_per_alloc());
+  region.PrintI64("tcmalloc_use_wider_slabs",
+                  tc_globals.cpu_cache().UseWiderSlabs());
+  region.PrintBool("tcmalloc_configure_size_class_max_capacity",
+                   tc_globals.cpu_cache().ConfigureSizeClassMaxCapacity());
+  region.PrintI64("tcmalloc_use_all_buckets_for_few_object_spans",
+                  Parameters::use_all_buckets_for_few_object_spans_in_cfl());
+
+  region.PrintRaw(
+      "size_class_config",
+      SizeClassConfigurationString(tc_globals.size_class_configuration()));
 }
 
 bool GetNumericProperty(const char* name_data, size_t name_size,
                         size_t* value) {
   // LINT.IfChange
-  ASSERT(name_data != nullptr);
-  ASSERT(value != nullptr);
+  TC_ASSERT_NE(name_data, nullptr);
+  TC_ASSERT_NE(value, nullptr);
   const absl::string_view name(name_data, name_size);
 
   // This is near the top since ReleasePerCpuMemoryToOS() calls it frequently.
@@ -660,7 +737,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
   }
 
   if (name == "generic.heap_size") {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     BackingStats stats = tc_globals.page_allocator().stats();
     *value = HeapSizeBytes(stats);
     return true;
@@ -690,7 +767,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
   if (name == "tcmalloc.slack_bytes") {
     // Kept for backwards compatibility.  Now defined externally as:
     //    pageheap_free_bytes + pageheap_unmapped_bytes.
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     BackingStats stats = tc_globals.page_allocator().stats();
     *value = SlackBytes(stats);
     return true;
@@ -698,14 +775,14 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
 
   if (name == "tcmalloc.pageheap_free_bytes" ||
       name == "tcmalloc.page_heap_free") {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     *value = tc_globals.page_allocator().stats().free_bytes;
     return true;
   }
 
   if (name == "tcmalloc.pageheap_unmapped_bytes" ||
       name == "tcmalloc.page_heap_unmapped") {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     // Arena non-resident bytes aren't on the page heap, but they are unmapped.
     *value = tc_globals.page_allocator().stats().unmapped_bytes +
              tc_globals.arena().stats().bytes_nonresident;
@@ -718,13 +795,13 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
   }
 
   if (name == "tcmalloc.page_algorithm") {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     *value = tc_globals.page_allocator().algorithm();
     return true;
   }
 
   if (name == "tcmalloc.max_total_thread_cache_bytes") {
-    absl::base_internal::SpinLockHolder l(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     *value = ThreadCache::overall_thread_cache_size();
     return true;
   }
@@ -772,26 +849,32 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
     return true;
   }
 
-  bool want_hard_limit = (name == "tcmalloc.hard_usage_limit_bytes");
-  if (want_hard_limit || name == "tcmalloc.desired_usage_limit_bytes") {
-    size_t amount;
-    bool is_hard;
-    std::tie(amount, is_hard) = tc_globals.page_allocator().limit();
-    if (want_hard_limit != is_hard) {
-      amount = std::numeric_limits<size_t>::max();
-    }
-    *value = amount;
+  auto limit_kind = (name == "tcmalloc.hard_usage_limit_bytes")
+                        ? PageAllocator::kHard
+                        : PageAllocator::kSoft;
+  if (limit_kind == PageAllocator::kHard ||
+      name == "tcmalloc.desired_usage_limit_bytes") {
+    *value = tc_globals.page_allocator().limit(limit_kind);
     return true;
   }
-  if (name == "tcmalloc.limit_hits") {
-    *value = tc_globals.page_allocator().limit_hits();
+  if (name == "tcmalloc.soft_limit_hits") {
+    *value = tc_globals.page_allocator().limit_hits(PageAllocator::kSoft);
     return true;
   }
-  if (name == "tcmalloc.successful_shrinks_after_limit_hit") {
-    *value = tc_globals.page_allocator().successful_shrinks_after_limit_hit();
+  if (name == "tcmalloc.hard_limit_hits") {
+    *value = tc_globals.page_allocator().limit_hits(PageAllocator::kHard);
     return true;
   }
-
+  if (name == "tcmalloc.successful_shrinks_after_soft_limit_hit") {
+    *value = tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+        PageAllocator::kSoft);
+    return true;
+  }
+  if (name == "tcmalloc.successful_shrinks_after_hard_limit_hit") {
+    *value = tc_globals.page_allocator().successful_shrinks_after_limit_hit(
+        PageAllocator::kHard);
+    return true;
+  }
   if (name == "tcmalloc.required_bytes") {
     TCMallocStats stats;
     ExtractTCMallocStats(&stats, false);
@@ -801,7 +884,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
 
   const absl::string_view kExperimentPrefix = "tcmalloc.experiment.";
   if (absl::StartsWith(name, kExperimentPrefix)) {
-    absl::optional<Experiment> exp =
+    std::optional<Experiment> exp =
         FindExperimentByName(absl::StripPrefix(name, kExperimentPrefix));
     if (exp.has_value()) {
       *value = IsExperimentActive(*exp) ? 1 : 0;
@@ -809,7 +892,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
     }
   }
 
-  // LINT.ThenChange(//depot/google3/tcmalloc/malloc_extension_test.cc)
+  // LINT.ThenChange(//depot/google3/tcmalloc/testing/malloc_extension_test.cc)
   return false;
 }
 

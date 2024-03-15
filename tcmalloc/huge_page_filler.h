@@ -19,740 +19,39 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/attributes.h"
 #include "absl/base/internal/cycleclock.h"
 #include "absl/base/optimization.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/hinted_tracker_lists.h"
 #include "tcmalloc/huge_cache.h"
+#include "tcmalloc/huge_page_subrelease.h"
 #include "tcmalloc/huge_pages.h"
-#include "tcmalloc/internal/lifetime_tracker.h"
+#include "tcmalloc/internal/clock.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/linked_list.h"
+#include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/optimization.h"
 #include "tcmalloc/internal/range_tracker.h"
 #include "tcmalloc/internal/timeseries_tracker.h"
+#include "tcmalloc/pages.h"
+#include "tcmalloc/span.h"
 #include "tcmalloc/stats.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
 
-// This and the following classes implement the adaptive hugepage subrelease
-// mechanism and realized fragmentation metric described in "Adaptive Hugepage
-// Subrelease for Non-moving Memory Allocators in Warehouse-Scale Computers"
-// (ISMM 2021).
-
-// Tracks correctness of skipped subrelease decisions over time.
-template <size_t kEpochs = 16>
-class SkippedSubreleaseCorrectnessTracker {
- public:
-  struct SkippedSubreleaseDecision {
-    Length pages;  // Number of pages we skipped subreleasing.
-    size_t count;  // Number of times we skipped a subrelease.
-
-    SkippedSubreleaseDecision() : pages(0), count(0) {}
-    explicit SkippedSubreleaseDecision(Length pages) : pages(pages), count(1) {}
-    explicit SkippedSubreleaseDecision(Length pages, size_t count)
-        : pages(pages), count(count) {}
-
-    SkippedSubreleaseDecision& operator+=(SkippedSubreleaseDecision rhs) {
-      pages += rhs.pages;
-      count += rhs.count;
-      return *this;
-    }
-
-    static SkippedSubreleaseDecision Zero() {
-      return SkippedSubreleaseDecision();
-    }
-  };
-
-  explicit constexpr SkippedSubreleaseCorrectnessTracker(Clock clock,
-                                                         absl::Duration w)
-      : window_(w),
-        epoch_length_(window_ / kEpochs),
-        last_confirmed_peak_(0),
-        tracker_(clock, w) {}
-
-  // Not copyable or movable
-  SkippedSubreleaseCorrectnessTracker(
-      const SkippedSubreleaseCorrectnessTracker&) = delete;
-  SkippedSubreleaseCorrectnessTracker& operator=(
-      const SkippedSubreleaseCorrectnessTracker&) = delete;
-
-  void ReportSkippedSubreleasePages(
-      Length skipped_pages, Length peak_pages,
-      absl::Duration expected_time_until_next_peak) {
-    total_skipped_ += SkippedSubreleaseDecision(skipped_pages);
-    pending_skipped_ += SkippedSubreleaseDecision(skipped_pages);
-
-    SkippedSubreleaseUpdate update;
-    update.decision = SkippedSubreleaseDecision(skipped_pages);
-    update.num_pages_at_decision = peak_pages;
-    update.correctness_interval_epochs =
-        expected_time_until_next_peak / epoch_length_;
-    tracker_.Report(update);
-  }
-
-  void ReportUpdatedPeak(Length current_peak) {
-    // Record this peak for the current epoch (so we don't double-count correct
-    // predictions later) and advance the tracker.
-    SkippedSubreleaseUpdate update;
-    update.confirmed_peak = current_peak;
-    if (tracker_.Report(update)) {
-      // Also keep track of the largest peak we have confirmed this epoch.
-      last_confirmed_peak_ = Length(0);
-    }
-
-    // Recompute currently pending decisions.
-    pending_skipped_ = SkippedSubreleaseDecision::Zero();
-
-    Length largest_peak_already_confirmed = last_confirmed_peak_;
-
-    tracker_.IterBackwards(
-        [&](size_t offset, int64_t ts, const SkippedSubreleaseEntry& e) {
-          // Do not clear any decisions in the current epoch.
-          if (offset == 0) {
-            return;
-          }
-
-          if (e.decisions.count > 0 &&
-              e.max_num_pages_at_decision > largest_peak_already_confirmed &&
-              offset <= e.correctness_interval_epochs) {
-            if (e.max_num_pages_at_decision <= current_peak) {
-              // We can confirm a subrelease decision as correct and it had not
-              // been confirmed correct by an earlier peak yet.
-              correctly_skipped_ += e.decisions;
-            } else {
-              pending_skipped_ += e.decisions;
-            }
-          }
-
-          // Did we clear any earlier decisions based on a peak in this epoch?
-          // Keep track of the peak, so we do not clear them again.
-          largest_peak_already_confirmed =
-              std::max(largest_peak_already_confirmed, e.max_confirmed_peak);
-        },
-        -1);
-
-    last_confirmed_peak_ = std::max(last_confirmed_peak_, current_peak);
-  }
-
-  inline SkippedSubreleaseDecision total_skipped() const {
-    return total_skipped_;
-  }
-
-  inline SkippedSubreleaseDecision correctly_skipped() const {
-    return correctly_skipped_;
-  }
-
-  inline SkippedSubreleaseDecision pending_skipped() const {
-    return pending_skipped_;
-  }
-
- private:
-  struct SkippedSubreleaseUpdate {
-    // A subrelease decision that was made at this time step: How much did we
-    // decide not to release?
-    SkippedSubreleaseDecision decision;
-
-    // What does our future demand have to be for this to be correct? If there
-    // were multiple subrelease decisions in the same epoch, use the max.
-    Length num_pages_at_decision;
-
-    // How long from the time of the decision do we have before the decision
-    // will be determined incorrect?
-    int64_t correctness_interval_epochs = 0;
-
-    // At this time step, we confirmed a demand peak at this level, which means
-    // all subrelease decisions in earlier time steps that had peak_demand_pages
-    // <= this confirmed_peak were confirmed correct and don't need to be
-    // considered again in the future.
-    Length confirmed_peak;
-  };
-
-  struct SkippedSubreleaseEntry {
-    SkippedSubreleaseDecision decisions = SkippedSubreleaseDecision::Zero();
-    Length max_num_pages_at_decision;
-    int64_t correctness_interval_epochs = 0;
-    Length max_confirmed_peak;
-
-    static SkippedSubreleaseEntry Nil() { return SkippedSubreleaseEntry(); }
-
-    void Report(SkippedSubreleaseUpdate e) {
-      decisions += e.decision;
-      correctness_interval_epochs =
-          std::max(correctness_interval_epochs, e.correctness_interval_epochs);
-      max_num_pages_at_decision =
-          std::max(max_num_pages_at_decision, e.num_pages_at_decision);
-      max_confirmed_peak = std::max(max_confirmed_peak, e.confirmed_peak);
-    }
-  };
-
-  const absl::Duration window_;
-  const absl::Duration epoch_length_;
-
-  // The largest peak we processed this epoch. This is required to avoid us
-  // double-counting correctly predicted decisions.
-  Length last_confirmed_peak_;
-
-  SkippedSubreleaseDecision total_skipped_;
-  SkippedSubreleaseDecision correctly_skipped_;
-  SkippedSubreleaseDecision pending_skipped_;
-
-  TimeSeriesTracker<SkippedSubreleaseEntry, SkippedSubreleaseUpdate, kEpochs>
-      tracker_;
-};
-
-struct SkipSubreleaseIntervals {
-  // Interval that locates recent demand peak.
-  absl::Duration peak_interval;
-  // Interval that locates recent short-term demand fluctuation.
-  absl::Duration short_interval;
-  // Interval that locates recent long-term demand trend.
-  absl::Duration long_interval;
-  // Checks if the peak interval is set.
-  bool IsPeakIntervalSet() const {
-    return peak_interval != absl::ZeroDuration();
-  }
-  // Checks if the skip subrelease feature is enabled.
-  bool SkipSubreleaseEnabled() const {
-    if (peak_interval != absl::ZeroDuration() ||
-        short_interval != absl::ZeroDuration() ||
-        long_interval != absl::ZeroDuration()) {
-      return true;
-    }
-    return false;
-  }
-};
-
-struct SubreleaseStats {
-  Length total_pages_subreleased;  // cumulative since startup
-  Length total_partial_alloc_pages_subreleased;  // cumulative since startup
-  Length num_pages_subreleased;
-  Length num_partial_alloc_pages_subreleased;
-  HugeLength total_hugepages_broken{NHugePages(0)};  // cumulative since startup
-  HugeLength num_hugepages_broken{NHugePages(0)};
-
-  bool is_limit_hit = false;
-  // Keep these limit-related stats cumulative since startup only
-  Length total_pages_subreleased_due_to_limit;
-  HugeLength total_hugepages_broken_due_to_limit{NHugePages(0)};
-
-  void reset() {
-    total_pages_subreleased += num_pages_subreleased;
-    total_partial_alloc_pages_subreleased +=
-        num_partial_alloc_pages_subreleased;
-    total_hugepages_broken += num_hugepages_broken;
-    num_pages_subreleased = Length(0);
-    num_partial_alloc_pages_subreleased = Length(0);
-    num_hugepages_broken = NHugePages(0);
-  }
-
-  // Must be called at the beginning of each subrelease request
-  void set_limit_hit(bool value) { is_limit_hit = value; }
-
-  // This only has a well-defined meaning within ReleaseCandidates where
-  // set_limit_hit() has been called earlier. Do not use anywhere else.
-  bool limit_hit() { return is_limit_hit; }
-};
-
-// Track filler statistics over a time window.
-template <size_t kEpochs = 16>
-class FillerStatsTracker {
- public:
-  enum Type {
-    kRegular,
-    kFewObjects = kRegular,
-    kManyObjects,
-    kDonated,
-    kPartialReleased,
-    kReleased,
-    kNumTypes
-  };
-
-  struct FillerStats {
-    Length num_pages;
-    Length free_pages;
-    Length unmapped_pages;
-    Length used_pages_in_subreleased_huge_pages;
-    HugeLength huge_pages[kNumTypes];
-    Length num_pages_subreleased;
-    Length num_partial_alloc_pages_subreleased;
-    HugeLength num_hugepages_broken = NHugePages(0);
-
-    HugeLength total_huge_pages() const {
-      HugeLength total_huge_pages;
-      for (int i = 0; i < kNumTypes; i++) {
-        total_huge_pages += huge_pages[i];
-      }
-      return total_huge_pages;
-    }
-  };
-
-  struct NumberOfFreePages {
-    Length free;
-    Length free_backed;
-  };
-
-  explicit constexpr FillerStatsTracker(Clock clock, absl::Duration w,
-                                        absl::Duration summary_interval)
-      : summary_interval_(summary_interval),
-        window_(w),
-        epoch_length_(window_ / kEpochs),
-        tracker_(clock, w),
-        skipped_subrelease_correctness_(clock, w) {
-    // The summary_interval is used in two trackers: FillerStatsTracker for
-    // evaluating realized fragmentation, and
-    // SkippedSubreleaseCorrectnessTracker for evaluating the correctness of
-    // skipped subrelease. Here we check the length of the two trackers are
-    // sufficient for the evaluation.
-    ASSERT(summary_interval <= w);
-  }
-
-  // Not copyable or movable
-  FillerStatsTracker(const FillerStatsTracker&) = delete;
-  FillerStatsTracker& operator=(const FillerStatsTracker&) = delete;
-
-  void Report(const FillerStats& stats) {
-    if (ABSL_PREDICT_FALSE(tracker_.Report(stats))) {
-      if (ABSL_PREDICT_FALSE(pending_skipped().count > 0)) {
-        // Consider the peak within the just completed epoch to confirm the
-        // correctness of any recent subrelease decisions.
-        skipped_subrelease_correctness_.ReportUpdatedPeak(std::max(
-            stats.num_pages,
-            tracker_.GetEpochAtOffset(1).stats[kStatsAtMaxDemand].num_pages));
-      }
-    }
-  }
-
-  void Print(Printer* out) const;
-  void PrintInPbtxt(PbtxtRegion* hpaa) const;
-
-  // Calculates recent peaks for skipping subrelease decisions. If our allocated
-  // memory is below the demand peak within the last peak_interval, we stop
-  // subreleasing. If our demand is going above that peak again within another
-  // realized fragemenation interval, we report that we made the correct
-  // decision.
-  Length GetRecentPeak(absl::Duration peak_interval) {
-    last_skip_subrelease_intervals_.peak_interval = peak_interval;
-    Length max_demand_pages;
-
-    int64_t num_epochs = peak_interval / epoch_length_;
-    tracker_.IterBackwards(
-        [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-          if (!e.empty()) {
-            // Identify the maximum number of demand pages we have seen within
-            // the time interval.
-            if (e.stats[kStatsAtMaxDemand].num_pages > max_demand_pages) {
-              max_demand_pages = e.stats[kStatsAtMaxDemand].num_pages;
-            }
-          }
-        },
-        num_epochs);
-
-    return max_demand_pages;
-  }
-
-  // Calculates demand requirements for skip subrelease: HugePageFiller would
-  // not subrelease if it has less pages than (or equal to) the required
-  // amount. We report that the skipping is correct if future demand is going to
-  // be above the required amount within another realized fragemenation
-  // interval. The demand requirement is the sum of short-term demand
-  // fluctuation peak and long-term demand trend. The former is the largest max
-  // and min demand difference within short_interval, and the latter is the
-  // largest min demand within long_interval. When both set, short_interval
-  // should be (significantly) shorter or equal to long_interval to avoid
-  // realized fragmentation caused by non-recent (short-term) demand spikes.
-  Length GetRecentDemand(absl::Duration short_interval,
-                         absl::Duration long_interval) {
-    if (short_interval != absl::ZeroDuration() &&
-        long_interval != absl::ZeroDuration()) {
-      ASSERT(short_interval <= long_interval);
-    }
-    last_skip_subrelease_intervals_.short_interval = short_interval;
-    last_skip_subrelease_intervals_.long_interval = long_interval;
-    Length short_term_fluctuation_pages, long_term_trend_pages;
-    int64_t short_epochs = short_interval / epoch_length_;
-    int64_t long_epochs = long_interval / epoch_length_;
-
-    tracker_.IterBackwards(
-        [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-          if (!e.empty()) {
-            Length demand_difference = e.stats[kStatsAtMaxDemand].num_pages -
-                                       e.stats[kStatsAtMinDemand].num_pages;
-            // Identifies the highest demand fluctuation (i.e., difference
-            // between max_demand and min_demand) that we have seen within the
-            // time interval.
-            if (demand_difference > short_term_fluctuation_pages) {
-              short_term_fluctuation_pages = demand_difference;
-            }
-          }
-        },
-        short_epochs);
-    tracker_.IterBackwards(
-        [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-          if (!e.empty()) {
-            // Identifies the long-term demand peak (i.e., largest minimum
-            // demand) that we have seen within the time interval.
-            if (e.stats[kStatsAtMinDemand].num_pages > long_term_trend_pages) {
-              long_term_trend_pages = e.stats[kStatsAtMinDemand].num_pages;
-            }
-          }
-        },
-        long_epochs);
-
-    return short_term_fluctuation_pages + long_term_trend_pages;
-  }
-
-  // Reports a skipped subrelease, which is evaluated by coming peaks within the
-  // realized fragmentation interval. The purpose is these skipped pages would
-  // only create realized fragmentation if peaks in that interval are
-  // smaller than peak_pages.
-  void ReportSkippedSubreleasePages(Length pages, Length peak_pages) {
-    ReportSkippedSubreleasePages(pages, peak_pages, summary_interval_);
-  }
-
-  // Reports a skipped subrelease, which is evaluated by coming peaks within the
-  // given time interval.
-  void ReportSkippedSubreleasePages(Length pages, Length peak_pages,
-                                    absl::Duration next_peak_interval) {
-    if (pages == Length(0)) {
-      return;
-    }
-    last_next_peak_interval_ = next_peak_interval;
-    skipped_subrelease_correctness_.ReportSkippedSubreleasePages(
-        pages, peak_pages, next_peak_interval);
-  }
-
-  inline typename SkippedSubreleaseCorrectnessTracker<
-      kEpochs>::SkippedSubreleaseDecision
-  total_skipped() const {
-    return skipped_subrelease_correctness_.total_skipped();
-  }
-
-  inline typename SkippedSubreleaseCorrectnessTracker<
-      kEpochs>::SkippedSubreleaseDecision
-  correctly_skipped() const {
-    return skipped_subrelease_correctness_.correctly_skipped();
-  }
-
-  inline typename SkippedSubreleaseCorrectnessTracker<
-      kEpochs>::SkippedSubreleaseDecision
-  pending_skipped() const {
-    return skipped_subrelease_correctness_.pending_skipped();
-  }
-
-  // Returns the minimum number of free pages throughout the tracker period.
-  // The first value of the pair is the number of all free pages, the second
-  // value contains only the backed ones.
-  NumberOfFreePages min_free_pages(absl::Duration w) const {
-    NumberOfFreePages mins;
-    mins.free = Length::max();
-    mins.free_backed = Length::max();
-
-    int64_t num_epochs = std::clamp(w / epoch_length_, int64_t{0},
-                                    static_cast<int64_t>(kEpochs));
-
-    tracker_.IterBackwards(
-        [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-          if (!e.empty()) {
-            mins.free = std::min(mins.free, e.min_free_pages);
-            mins.free_backed =
-                std::min(mins.free_backed, e.min_free_backed_pages);
-          }
-        },
-        num_epochs);
-    mins.free = (mins.free == Length::max()) ? Length(0) : mins.free;
-    mins.free_backed =
-        (mins.free_backed == Length::max()) ? Length(0) : mins.free_backed;
-    return mins;
-  }
-
- private:
-  // We collect filler statistics at four "interesting points" within each time
-  // step: at min/max demand of pages and at min/max use of hugepages. This
-  // allows us to approximate the envelope of the different metrics.
-  enum StatsType {
-    kStatsAtMinDemand,
-    kStatsAtMaxDemand,
-    kStatsAtMinHugePages,
-    kStatsAtMaxHugePages,
-    kNumStatsTypes
-  };
-
-  struct FillerStatsEntry {
-    // Collect filler stats at "interesting points" (minimum/maximum page demand
-    // and at minimum/maximum usage of huge pages).
-    FillerStats stats[kNumStatsTypes] = {};
-    static constexpr Length kDefaultValue = Length::max();
-    Length min_free_pages = kDefaultValue;
-    Length min_free_backed_pages = kDefaultValue;
-    Length num_pages_subreleased;
-    Length num_partial_alloc_pages_subreleased;
-    HugeLength num_hugepages_broken = NHugePages(0);
-
-    static FillerStatsEntry Nil() { return FillerStatsEntry(); }
-
-    void Report(const FillerStats& e) {
-      if (empty()) {
-        for (int i = 0; i < kNumStatsTypes; i++) {
-          stats[i] = e;
-        }
-      }
-
-      if (e.num_pages < stats[kStatsAtMinDemand].num_pages) {
-        stats[kStatsAtMinDemand] = e;
-      }
-
-      if (e.num_pages > stats[kStatsAtMaxDemand].num_pages) {
-        stats[kStatsAtMaxDemand] = e;
-      }
-
-      if (e.total_huge_pages() <
-          stats[kStatsAtMinHugePages].total_huge_pages()) {
-        stats[kStatsAtMinHugePages] = e;
-      }
-
-      if (e.total_huge_pages() >
-          stats[kStatsAtMaxHugePages].total_huge_pages()) {
-        stats[kStatsAtMaxHugePages] = e;
-      }
-
-      min_free_pages =
-          std::min(min_free_pages, e.free_pages + e.unmapped_pages);
-      min_free_backed_pages = std::min(min_free_backed_pages, e.free_pages);
-
-      // Subrelease stats
-      num_pages_subreleased += e.num_pages_subreleased;
-      num_partial_alloc_pages_subreleased +=
-          e.num_partial_alloc_pages_subreleased;
-      num_hugepages_broken += e.num_hugepages_broken;
-    }
-
-    bool empty() const { return min_free_pages == kDefaultValue; }
-  };
-
-  // The tracker reports pages that have been free for at least this interval,
-  // as well as peaks within this interval. The interval is also used for
-  // deciding correctness of skipped subreleases by associating past skipping
-  // decisions to peaks within this interval.
-  const absl::Duration summary_interval_;
-
-  const absl::Duration window_;
-  const absl::Duration epoch_length_;
-
-  TimeSeriesTracker<FillerStatsEntry, FillerStats, kEpochs> tracker_;
-  SkippedSubreleaseCorrectnessTracker<kEpochs> skipped_subrelease_correctness_;
-
-  // Records most recent intervals for skipping subreleases, plus expected next
-  // peak_interval for evaluating skipped subreleases. All for reporting and
-  // debugging only.
-  SkipSubreleaseIntervals last_skip_subrelease_intervals_;
-  absl::Duration last_next_peak_interval_;
-};
-
-// Evaluates a/b, avoiding division by zero.
-inline double safe_div(Length a, Length b) {
-  return safe_div(a.raw_num(), b.raw_num());
-}
-
-template <size_t kEpochs>
-void FillerStatsTracker<kEpochs>::Print(Printer* out) const {
-  NumberOfFreePages free_pages = min_free_pages(summary_interval_);
-  out->printf("HugePageFiller: time series over %d min interval\n\n",
-              absl::ToInt64Minutes(summary_interval_));
-
-  // Realized fragmentation is equivalent to backed minimum free pages over a
-  // 5-min interval. It is printed for convenience but not included in pbtxt.
-  out->printf("HugePageFiller: realized fragmentation: %.1f MiB\n",
-              free_pages.free_backed.in_mib());
-  out->printf("HugePageFiller: minimum free pages: %zu (%zu backed)\n",
-              free_pages.free.raw_num(), free_pages.free_backed.raw_num());
-
-  FillerStatsEntry at_peak_demand;
-  FillerStatsEntry at_peak_hps;
-
-  tracker_.IterBackwards(
-      [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-        if (!e.empty()) {
-          if (at_peak_demand.empty() ||
-              at_peak_demand.stats[kStatsAtMaxDemand].num_pages <
-                  e.stats[kStatsAtMaxDemand].num_pages) {
-            at_peak_demand = e;
-          }
-
-          if (at_peak_hps.empty() ||
-              at_peak_hps.stats[kStatsAtMaxHugePages].total_huge_pages() <
-                  e.stats[kStatsAtMaxHugePages].total_huge_pages()) {
-            at_peak_hps = e;
-          }
-        }
-      },
-      summary_interval_ / epoch_length_);
-
-  out->printf(
-      "HugePageFiller: at peak demand: %zu pages (and %zu free, %zu unmapped)\n"
-      "HugePageFiller: at peak demand: %zu hps (%zu regular, %zu donated, "
-      "%zu partial, %zu released)\n",
-      at_peak_demand.stats[kStatsAtMaxDemand].num_pages.raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].free_pages.raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].unmapped_pages.raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].total_huge_pages().raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].huge_pages[kRegular].raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].huge_pages[kDonated].raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand]
-          .huge_pages[kPartialReleased]
-          .raw_num(),
-      at_peak_demand.stats[kStatsAtMaxDemand].huge_pages[kReleased].raw_num());
-
-  out->printf(
-      "HugePageFiller: at peak hps: %zu pages (and %zu free, %zu unmapped)\n"
-      "HugePageFiller: at peak hps: %zu hps (%zu regular, %zu donated, "
-      "%zu partial, %zu released)\n",
-      at_peak_hps.stats[kStatsAtMaxDemand].num_pages.raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].free_pages.raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].unmapped_pages.raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].total_huge_pages().raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].huge_pages[kRegular].raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].huge_pages[kDonated].raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand]
-          .huge_pages[kPartialReleased]
-          .raw_num(),
-      at_peak_hps.stats[kStatsAtMaxDemand].huge_pages[kReleased].raw_num());
-
-  out->printf(
-      "\nHugePageFiller: Since the start of the execution, %zu subreleases (%zu"
-      " pages) were skipped due to either recent (%ds) peaks, or the sum of"
-      " short-term (%ds) fluctuations and long-term (%ds) trends.\n",
-      total_skipped().count, total_skipped().pages.raw_num(),
-      absl::ToInt64Seconds(last_skip_subrelease_intervals_.peak_interval),
-      absl::ToInt64Seconds(last_skip_subrelease_intervals_.short_interval),
-      absl::ToInt64Seconds(last_skip_subrelease_intervals_.long_interval));
-
-  Length skipped_pages = total_skipped().pages - pending_skipped().pages;
-  double correctly_skipped_pages_percentage =
-      safe_div(100.0 * correctly_skipped().pages, skipped_pages);
-
-  size_t skipped_count = total_skipped().count - pending_skipped().count;
-  double correctly_skipped_count_percentage =
-      safe_div(100.0 * correctly_skipped().count, skipped_count);
-
-  out->printf(
-      "HugePageFiller: %.4f%% of decisions confirmed correct, %zu "
-      "pending (%.4f%% of pages, %zu pending), as per anticipated %ds realized "
-      "fragmentation.\n",
-      correctly_skipped_count_percentage, pending_skipped().count,
-      correctly_skipped_pages_percentage, pending_skipped().pages.raw_num(),
-      absl::ToInt64Seconds(last_next_peak_interval_));
-
-  // Print subrelease stats
-  Length total_subreleased;
-  Length total_partial_alloc_pages_subreleased;
-  HugeLength total_broken = NHugePages(0);
-  tracker_.Iter(
-      [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-        total_subreleased += e.num_pages_subreleased;
-        total_partial_alloc_pages_subreleased +=
-            e.num_partial_alloc_pages_subreleased;
-        total_broken += e.num_hugepages_broken;
-      },
-      tracker_.kSkipEmptyEntries);
-  out->printf(
-      "HugePageFiller: Subrelease stats last %d min: total "
-      "%zu pages subreleased (%zu pages from partial allocs), "
-      "%zu hugepages broken\n",
-      static_cast<int64_t>(absl::ToInt64Minutes(window_)),
-      total_subreleased.raw_num(),
-      total_partial_alloc_pages_subreleased.raw_num(), total_broken.raw_num());
-}
-
-template <size_t kEpochs>
-void FillerStatsTracker<kEpochs>::PrintInPbtxt(PbtxtRegion* hpaa) const {
-  {
-    auto skip_subrelease = hpaa->CreateSubRegion("filler_skipped_subrelease");
-    skip_subrelease.PrintI64(
-        "skipped_subrelease_interval_ms",
-        absl::ToInt64Milliseconds(
-            last_skip_subrelease_intervals_.peak_interval));
-    skip_subrelease.PrintI64(
-        "skipped_subrelease_short_interval_ms",
-        absl::ToInt64Milliseconds(
-            last_skip_subrelease_intervals_.short_interval));
-    skip_subrelease.PrintI64(
-        "skipped_subrelease_long_interval_ms",
-        absl::ToInt64Milliseconds(
-            last_skip_subrelease_intervals_.long_interval));
-    skip_subrelease.PrintI64("skipped_subrelease_pages",
-                             total_skipped().pages.raw_num());
-    skip_subrelease.PrintI64("correctly_skipped_subrelease_pages",
-                             correctly_skipped().pages.raw_num());
-    skip_subrelease.PrintI64("pending_skipped_subrelease_pages",
-                             pending_skipped().pages.raw_num());
-    skip_subrelease.PrintI64("skipped_subrelease_count", total_skipped().count);
-    skip_subrelease.PrintI64("correctly_skipped_subrelease_count",
-                             correctly_skipped().count);
-    skip_subrelease.PrintI64("pending_skipped_subrelease_count",
-                             pending_skipped().count);
-    skip_subrelease.PrintI64(
-        "next_peak_interval_ms",
-        absl::ToInt64Milliseconds(last_next_peak_interval_));
-  }
-
-  auto filler_stats = hpaa->CreateSubRegion("filler_stats_timeseries");
-  filler_stats.PrintI64("window_ms", absl::ToInt64Milliseconds(epoch_length_));
-  filler_stats.PrintI64("epochs", kEpochs);
-
-  NumberOfFreePages free_pages = min_free_pages(summary_interval_);
-  filler_stats.PrintI64("min_free_pages_interval_ms",
-                        absl::ToInt64Milliseconds(summary_interval_));
-  filler_stats.PrintI64("min_free_pages", free_pages.free.raw_num());
-  filler_stats.PrintI64("min_free_backed_pages",
-                        free_pages.free_backed.raw_num());
-
-  static const char* labels[kNumStatsTypes] = {
-      "at_minimum_demand", "at_maximum_demand", "at_minimum_huge_pages",
-      "at_maximum_huge_pages"};
-
-  tracker_.Iter(
-      [&](size_t offset, int64_t ts, const FillerStatsEntry& e) {
-        auto region = filler_stats.CreateSubRegion("measurements");
-        region.PrintI64("epoch", offset);
-        region.PrintI64("timestamp_ms",
-                        absl::ToInt64Milliseconds(absl::Nanoseconds(ts)));
-        region.PrintI64("min_free_pages", e.min_free_pages.raw_num());
-        region.PrintI64("min_free_backed_pages",
-                        e.min_free_backed_pages.raw_num());
-        region.PrintI64("num_pages_subreleased",
-                        e.num_pages_subreleased.raw_num());
-        region.PrintI64("num_hugepages_broken",
-                        e.num_hugepages_broken.raw_num());
-        region.PrintI64("partial_alloc_pages_subreleased",
-                        e.num_partial_alloc_pages_subreleased.raw_num());
-        for (int i = 0; i < kNumStatsTypes; i++) {
-          auto m = region.CreateSubRegion(labels[i]);
-          FillerStats stats = e.stats[i];
-          m.PrintI64("num_pages", stats.num_pages.raw_num());
-          m.PrintI64("regular_huge_pages",
-                     stats.huge_pages[kRegular].raw_num());
-          m.PrintI64("donated_huge_pages",
-                     stats.huge_pages[kDonated].raw_num());
-          m.PrintI64("partial_released_huge_pages",
-                     stats.huge_pages[kPartialReleased].raw_num());
-          m.PrintI64("released_huge_pages",
-                     stats.huge_pages[kReleased].raw_num());
-          m.PrintI64("used_pages_in_subreleased_huge_pages",
-                     stats.used_pages_in_subreleased_huge_pages.raw_num());
-        }
-      },
-      tracker_.kSkipEmptyEntries);
-}
-
-static constexpr size_t kFewObjectsAllocMaxLimit = 16;
-inline bool IsManyObjectsSpan(int span_objects_count) {
-  return span_objects_count > kFewObjectsAllocMaxLimit;
+inline bool IsDenseSpan(AccessDensityPrediction density) {
+  return density == AccessDensityPrediction::kDense;
 }
 
 // PageTracker keeps track of the allocation status of every page in a HugePage.
@@ -762,17 +61,16 @@ inline bool IsManyObjectsSpan(int span_objects_count) {
 // to support unlocking the page heap lock in a dynamic annotation-friendly way.
 class PageTracker : public TList<PageTracker>::Elem {
  public:
-  PageTracker(HugePage p, uint64_t when, bool was_donated)
+  PageTracker(HugePage p, bool was_donated)
       : location_(p),
         released_count_(0),
         abandoned_count_(0),
         donated_(false),
         was_donated_(was_donated),
+        was_released_(false),
         abandoned_(false),
         unbroken_(true),
         free_{} {
-    init_when(when);
-
 #ifndef __ppc64__
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -790,16 +88,6 @@ class PageTracker : public TList<PageTracker>::Elem {
                       2 * ABSL_CACHELINE_SIZE,
                   "location_ should fall within the first two cachelines of "
                   "PageTracker.");
-    static_assert(
-        offsetof(PageTracker, when_numerator_) + sizeof(when_numerator_) <=
-            2 * ABSL_CACHELINE_SIZE,
-        "when_numerator_ should fall within the first two cachelines "
-        "of PageTracker.");
-    static_assert(
-        offsetof(PageTracker, when_denominator_) + sizeof(when_denominator_) <=
-            2 * ABSL_CACHELINE_SIZE,
-        "when_denominator_ should fall within the first two "
-        "cachelines of PageTracker.");
     static_assert(
         offsetof(PageTracker, donated_) + sizeof(donated_) <=
             2 * ABSL_CACHELINE_SIZE,
@@ -844,6 +132,9 @@ class PageTracker : public TList<PageTracker>::Elem {
   // memory persistently donated to the filler.
   bool was_donated() const { return was_donated_; }
 
+  bool was_released() const { return was_released_; }
+  void set_was_released(bool status) { was_released_ = status; }
+
   // Tracks whether the page, previously donated to the filler, was abondoned.
   // When a large allocation is deallocated but the huge page is not
   // reassembled, the pages are abondoned to the filler for future allocations.
@@ -870,35 +161,20 @@ class PageTracker : public TList<PageTracker>::Elem {
 
   bool unbroken() const { return unbroken_; }
 
-  // Returns a linked list of trackers ordered by deadline.
-  LifetimeTracker::Tracker* lifetime_tracker() { return &lifetime_tracker_; }
-
   // Returns the hugepage whose availability is being tracked.
   HugePage location() const { return location_; }
 
   // Return all unused pages to the system, mark future frees to do same.
   // Returns the count of pages unbacked.
-  Length ReleaseFree(MemoryModifyFunction unback)
+  Length ReleaseFree(MemoryModifyFunction& unback)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
-  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large,
-                    PageAgeHistograms* ages) const;
-  bool HasManyObjectsSpans() const { return has_many_objects_spans_; }
-  void SetHasManyObjectsSpans() { has_many_objects_spans_ = true; }
+  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large) const;
+  bool HasDenseSpans() const { return has_dense_spans_; }
+  void SetHasDenseSpans() { has_dense_spans_ = true; }
 
  private:
-  void init_when(uint64_t w) {
-    const Length before = Length(free_.total_free());
-    when_numerator_ = w * before.raw_num();
-    when_denominator_ = before.raw_num();
-  }
-
   HugePage location_;
-  // We keep track of an average time weighted by Length::raw_num. In order to
-  // avoid doing division on fast path, store the numerator and denominator and
-  // only do the division when we need the average.
-  uint64_t when_numerator_;
-  uint64_t when_denominator_;
 
   // Cached value of released_by_page_.CountBits(0, kPagesPerHugePages)
   //
@@ -907,6 +183,7 @@ class PageTracker : public TList<PageTracker>::Elem {
   uint16_t abandoned_count_;
   bool donated_;
   bool was_donated_;
+  bool was_released_;
   // Tracks whether we accounted for the abandoned state of the page. When a
   // large allocation is deallocated but the huge page can not be reassembled,
   // we measure the number of pages abandoned to the filler. To make sure that
@@ -933,13 +210,10 @@ class PageTracker : public TList<PageTracker>::Elem {
                     std::numeric_limits<uint16_t>::max(),
                 "nallocs must be able to support kPagesPerHugePage!");
 
-  // Tracks the lifetime of the donated object associated with this tracker.
-  LifetimeTracker::Tracker lifetime_tracker_;
-
-  bool has_many_objects_spans_ = false;
+  bool has_dense_spans_ = false;
 
   ABSL_MUST_USE_RESULT bool ReleasePages(PageId p, Length n,
-                                         MemoryModifyFunction unback) {
+                                         MemoryModifyFunction& unback) {
     void* ptr = p.start_addr();
     size_t byte_len = n.in_bytes();
     bool success = unback(ptr, byte_len);
@@ -950,34 +224,30 @@ class PageTracker : public TList<PageTracker>::Elem {
   }
 };
 
-// As of March 2023, we allocate as if all spans have few objects on them.
-//
-// When we separate allocs into few/many spans
-// (separate_allocs_for_few_and_many_objects_spans_), we use both values of
-// ObjectCount.  Spans with more objects are allocated from index kMany.
-enum ObjectCount {
-  kFew = 0,
-  kMany = 1,
-  kObjectCounts,
-};
-
 // Records number of hugepages in different types of allocs.
 //
 // We use an additional element in the array to record the total sum of pages
-// in kFew and kMany allocs.
+// in kSparse and kDense allocs.
 struct HugePageFillerStats {
   // Number of hugepages in fully-released alloc.
-  HugeLength n_fully_released[kObjectCounts + 1];
+  HugeLength n_fully_released[AccessDensityPrediction::kPredictionCounts + 1];
   // Number of hugepages in partially-released alloc.
-  HugeLength n_partial_released[kObjectCounts + 1];
+  HugeLength n_partial_released[AccessDensityPrediction::kPredictionCounts + 1];
   // Total hugepages that are either in fully- or partially-released allocs.
-  HugeLength n_released[kObjectCounts + 1];
+  HugeLength n_released[AccessDensityPrediction::kPredictionCounts + 1];
   // Total hugepages in the filler of a particular object count.
-  HugeLength n_total[kObjectCounts + 1];
+  HugeLength n_total[AccessDensityPrediction::kPredictionCounts + 1];
   // Total hugepages that have been fully allocated.
-  HugeLength n_full[kObjectCounts + 1];
+  HugeLength n_full[AccessDensityPrediction::kPredictionCounts + 1];
   // Number of hugepages in partially allocated (but not released) allocs.
-  HugeLength n_partial[kObjectCounts + 1];
+  HugeLength n_partial[AccessDensityPrediction::kPredictionCounts + 1];
+};
+
+enum class HugePageFillerAllocsOption : bool {
+  // Same allocs for sparse and dense spans
+  kUnifiedAllocs,
+  // Separate allocs for sparse and dense spans
+  kSeparateAllocs,
 };
 
 // This tracks a set of unfilled hugepages, and fulfills allocations
@@ -986,17 +256,19 @@ struct HugePageFillerStats {
 template <class TrackerType>
 class HugePageFiller {
  public:
-  explicit HugePageFiller(bool separate_allocs_for_few_and_many_objects_spans,
-                          MemoryModifyFunction unback);
-  HugePageFiller(Clock clock,
-                 bool separate_allocs_for_few_and_many_objects_spans,
-                 MemoryModifyFunction unback);
+  explicit HugePageFiller(
+      HugePageFillerAllocsOption allocs_option, size_t chunks_per_alloc,
+      MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND);
+  HugePageFiller(Clock clock, HugePageFillerAllocsOption allocs_options,
+                 size_t chunks_per_alloc,
+                 MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND);
 
   typedef TrackerType Tracker;
 
   struct TryGetResult {
     TrackerType* pt;
     PageId page;
+    bool from_released;
   };
 
   // Our API is simple, but note that it does not include an unconditional
@@ -1008,50 +280,66 @@ class HugePageFiller {
   // number of individual objects that would be allocated on these n pages.
   //
   // On failure, returns nullptr/PageId{0}.
-  TryGetResult TryGet(Length n, size_t num_objects)
+  TryGetResult TryGet(Length n, SpanAllocInfo span_alloc_info)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
   // Marks [p, p + n) as usable by new allocations into *pt; returns pt
   // if that hugepage is now empty (nullptr otherwise.)
   // REQUIRES: pt is owned by this object (has been Contribute()), and
   // {pt, p, n} was the result of a previous TryGet.
-  TrackerType* Put(TrackerType* pt, PageId p, Length n, size_t num_objects)
+  TrackerType* Put(TrackerType* pt, PageId p, Length n)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
   // Contributes a tracker to the filler. If "donated," then the tracker is
   // marked as having come from the tail of a multi-hugepage allocation, which
   // causes it to be treated slightly differently.
-  void Contribute(TrackerType* pt, bool donated, size_t num_objects);
+  void Contribute(TrackerType* pt, bool donated, SpanAllocInfo span_alloc_info);
 
   HugeLength size() const { return size_; }
 
   // Useful statistics
-  Length pages_allocated(ObjectCount type) const {
-    ASSERT(type < ObjectCount::kObjectCounts);
+  Length pages_allocated(AccessDensityPrediction type) const {
+    TC_ASSERT_LT(type, AccessDensityPrediction::kPredictionCounts);
     return pages_allocated_[type];
   }
   Length pages_allocated() const {
-    return pages_allocated_[kMany] + pages_allocated_[kFew];
+    return pages_allocated_[AccessDensityPrediction::kSparse] +
+           pages_allocated_[AccessDensityPrediction::kDense];
   }
   Length used_pages() const { return pages_allocated(); }
   Length unmapped_pages() const { return unmapped_; }
   Length free_pages() const;
   Length used_pages_in_released() const {
-    ASSERT(n_used_released_[kFew] <=
-           regular_alloc_released_[kFew].size().in_pages());
-    ASSERT(n_used_released_[kMany] <=
-           regular_alloc_released_[kMany].size().in_pages());
-    return n_used_released_[kMany] + n_used_released_[kFew];
+    ASSERT(n_used_released_[AccessDensityPrediction::kSparse] <=
+           regular_alloc_released_[AccessDensityPrediction::kSparse]
+               .size()
+               .in_pages());
+    ASSERT(n_used_released_[AccessDensityPrediction::kDense] <=
+           regular_alloc_released_[AccessDensityPrediction::kDense]
+               .size()
+               .in_pages());
+    return n_used_released_[AccessDensityPrediction::kDense] +
+           n_used_released_[AccessDensityPrediction::kSparse];
   }
   Length used_pages_in_partial_released() const {
-    ASSERT(n_used_partial_released_[kFew] <=
-           regular_alloc_partial_released_[kFew].size().in_pages());
-    ASSERT(n_used_partial_released_[kMany] <=
-           regular_alloc_partial_released_[kMany].size().in_pages());
-    return n_used_partial_released_[kMany] + n_used_partial_released_[kFew];
+    ASSERT(n_used_partial_released_[AccessDensityPrediction::kSparse] <=
+           regular_alloc_partial_released_[AccessDensityPrediction::kSparse]
+               .size()
+               .in_pages());
+    ASSERT(n_used_partial_released_[AccessDensityPrediction::kDense] <=
+           regular_alloc_partial_released_[AccessDensityPrediction::kDense]
+               .size()
+               .in_pages());
+    return n_used_partial_released_[AccessDensityPrediction::kDense] +
+           n_used_partial_released_[AccessDensityPrediction::kSparse];
   }
   Length used_pages_in_any_subreleased() const {
     return used_pages_in_released() + used_pages_in_partial_released();
+  }
+
+  HugeLength previously_released_huge_pages() const {
+    return n_was_released_[AccessDensityPrediction::kDense] +
+           n_was_released_[AccessDensityPrediction::kSparse];
   }
 
   Length FreePagesInPartialAllocs() const;
@@ -1077,6 +365,7 @@ class HugePageFiller {
   // be greater than the desired number of pages.
   // Returns the number of pages actually released. The releasing target can be
   // reduced by skip subrelease which is disabled if all intervals are zero.
+  static constexpr double kPartialAllocPagesRelease = 0.1;
   Length ReleasePages(Length desired, SkipSubreleaseIntervals intervals,
                       bool release_partial_alloc_pages, bool hit_limit)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
@@ -1085,8 +374,7 @@ class HugePageFiller {
   static constexpr size_t kCandidatesForReleasingMemory =
       kPagesPerHugePage.raw_num();
 
-  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large,
-                    PageAgeHistograms* ages) const;
+  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large) const;
 
   BackingStats stats() const;
   SubreleaseStats subrelease_stats() const { return subrelease_stats_; }
@@ -1109,18 +397,21 @@ class HugePageFiller {
   SubreleaseStats subrelease_stats_;
 
   // We group hugepages first by longest-free (as a measure of fragmentation),
-  // then into 8 chunks inside there by desirability of allocation.
-  static constexpr size_t kChunks = 8;
-  // Which chunk should this hugepage be in?
-  // This returns the largest possible value kChunks-1 iff pt has a single
+  // then into chunks_per_alloc_ chunks inside there by desirability of
   // allocation.
+  static constexpr size_t kChunks = 16;
+  // Which chunk should this hugepage be in?
+  // This returns the largest possible value chunks_per_alloc_ - 1 iff
+  // pt has a single allocation.
   size_t IndexFor(TrackerType* pt) const;
   // Returns index for regular_alloc_.
   size_t ListFor(Length longest, size_t chunk) const;
   static constexpr size_t kNumLists = kPagesPerHugePage.raw_num() * kChunks;
+  const size_t chunks_per_alloc_;
 
   // List of hugepages from which no pages have been released to the OS.
-  PageTrackerLists<kNumLists> regular_alloc_[kObjectCounts];
+  PageTrackerLists<kNumLists>
+      regular_alloc_[AccessDensityPrediction::kPredictionCounts];
   PageTrackerLists<kPagesPerHugePage.raw_num()> donated_alloc_;
   // Partially released ones that we are trying to release.
   //
@@ -1135,16 +426,21 @@ class HugePageFiller {
   // regular_alloc_released_:  This list contains huge pages whose pages are
   // either allocated or returned to the OS.  There are no pages that are free,
   // but not returned to the OS.
-  PageTrackerLists<kNumLists> regular_alloc_partial_released_[kObjectCounts];
-  PageTrackerLists<kNumLists> regular_alloc_released_[kObjectCounts];
+  PageTrackerLists<kNumLists> regular_alloc_partial_released_
+      [AccessDensityPrediction::kPredictionCounts];
+  PageTrackerLists<kNumLists>
+      regular_alloc_released_[AccessDensityPrediction::kPredictionCounts];
   // n_used_released_ contains the number of pages in huge pages that are not
   // free (i.e., allocated).  Only the hugepages in regular_alloc_released_ are
   // considered.
-  Length n_used_released_[kObjectCounts];
+  Length n_used_released_[AccessDensityPrediction::kPredictionCounts];
+
+  HugeLength n_was_released_[AccessDensityPrediction::kPredictionCounts];
   // n_used_partial_released_ is the number of pages which have been allocated
   // from the hugepages in the set regular_alloc_partial_released.
-  Length n_used_partial_released_[kObjectCounts];
-  const bool separate_allocs_for_few_and_many_objects_spans_ = false;
+  Length n_used_partial_released_[AccessDensityPrediction::kPredictionCounts];
+  const HugePageFillerAllocsOption allocs_for_sparse_and_dense_spans_ =
+      HugePageFillerAllocsOption::kUnifiedAllocs;
 
   // RemoveFromFillerList pt from the appropriate PageTrackerList.
   void RemoveFromFillerList(TrackerType* pt);
@@ -1156,22 +452,21 @@ class HugePageFiller {
 
   void PrintAllocStatsInPbtxt(absl::string_view field, PbtxtRegion* hpaa,
                               const HugePageFillerStats& stats,
-                              ObjectCount count) const;
+                              AccessDensityPrediction count) const;
   // CompareForSubrelease identifies the worse candidate for subrelease, between
   // the choice of huge pages a and b.
   static bool CompareForSubrelease(TrackerType* a, TrackerType* b) {
-    ASSERT(a != nullptr);
-    ASSERT(b != nullptr);
+    TC_ASSERT_NE(a, nullptr);
+    TC_ASSERT_NE(b, nullptr);
 
     if (a->used_pages() < b->used_pages()) return true;
     if (a->used_pages() > b->used_pages()) return false;
-    // If 'a' has many objects spans, then we do not prefer to release from 'a'
+    // If 'a' has dense spans, then we do not prefer to release from 'a'
     // compared to 'b'.
-    if (a->HasManyObjectsSpans()) return false;
-    // We know 'a' does not have many object spans.  If 'b' has many object
-    // spans, then we prefer to release from 'a'.  Otherwise, we do not prefer
-    // either.
-    return b->HasManyObjectsSpans();
+    if (a->HasDenseSpans()) return false;
+    // We know 'a' does not have dense spans.  If 'b' has dense spans, then we
+    // prefer to release from 'a'.  Otherwise, we do not prefer either.
+    return b->HasDenseSpans();
   }
 
   // SelectCandidates identifies the candidates.size() best candidates in the
@@ -1192,7 +487,7 @@ class HugePageFiller {
 
   HugeLength size_;
 
-  Length pages_allocated_[kObjectCounts];
+  Length pages_allocated_[AccessDensityPrediction::kPredictionCounts];
   Length unmapped_;
 
   // How much have we eagerly unmapped (in already released hugepages), but
@@ -1201,9 +496,9 @@ class HugePageFiller {
 
   // Functionality related to time series tracking.
   void UpdateFillerStatsTracker();
-  using StatsTrackerType = FillerStatsTracker<600>;
+  using StatsTrackerType = SubreleaseStatsTracker<600>;
   StatsTrackerType fillerstats_tracker_;
-  MemoryModifyFunction unback_;
+  MemoryModifyFunction& unback_;
 };
 
 inline typename PageTracker::PageAllocation PageTracker::Get(Length n) {
@@ -1221,7 +516,7 @@ inline typename PageTracker::PageAllocation PageTracker::Get(Length n) {
   if (ABSL_PREDICT_FALSE(released_count_ > 0)) {
     unbacked = released_by_page_.CountBits(index, n.raw_num());
     released_by_page_.ClearRange(index, n.raw_num());
-    ASSERT(released_count_ >= unbacked);
+    TC_ASSERT_GE(released_count_, unbacked);
     released_count_ -= unbacked;
   }
 
@@ -1234,12 +529,9 @@ inline typename PageTracker::PageAllocation PageTracker::Get(Length n) {
 inline void PageTracker::Put(PageId p, Length n) {
   Length index = p - location_.first_page();
   free_.Unmark(index.raw_num(), n.raw_num());
-
-  when_numerator_ += n.raw_num() * absl::base_internal::CycleClock::Now();
-  when_denominator_ += n.raw_num();
 }
 
-inline Length PageTracker::ReleaseFree(MemoryModifyFunction unback) {
+inline Length PageTracker::ReleaseFree(MemoryModifyFunction& unback) {
   size_t count = 0;
   size_t index = 0;
   size_t n;
@@ -1285,17 +577,13 @@ inline Length PageTracker::ReleaseFree(MemoryModifyFunction unback) {
   ASSERT(Length(released_count_) <= kPagesPerHugePage);
   ASSERT(released_by_page_.CountBits(0, kPagesPerHugePage.raw_num()) ==
          released_count_);
-  init_when(absl::base_internal::CycleClock::Now());
   return Length(count);
 }
 
 inline void PageTracker::AddSpanStats(SmallSpanStats* small,
-                                      LargeSpanStats* large,
-                                      PageAgeHistograms* ages) const {
+                                      LargeSpanStats* large) const {
   size_t index = 0, n;
 
-  uint64_t w = when_denominator_ == 0 ? when_numerator_
-                                      : when_numerator_ / when_denominator_;
   while (free_.NextFreeRange(index, &index, &n)) {
     bool is_released = released_by_page_.GetBit(index);
     // Find the last bit in the run with the same state (set or cleared) as
@@ -1308,7 +596,7 @@ inline void PageTracker::AddSpanStats(SmallSpanStats* small,
                         : released_by_page_.FindSet(index + 1);
     }
     n = std::min(end - index, n);
-    ASSERT(n > 0);
+    TC_ASSERT_GT(n, 0);
 
     if (n < kMaxPages.raw_num()) {
       if (small != nullptr) {
@@ -1329,9 +617,6 @@ inline void PageTracker::AddSpanStats(SmallSpanStats* small,
       }
     }
 
-    if (ages) {
-      ages->RecordRange(Length(n), is_released, w);
-    }
     index += n;
   }
 }
@@ -1344,26 +629,28 @@ inline Length PageTracker::free_pages() const {
 
 template <class TrackerType>
 inline HugePageFiller<TrackerType>::HugePageFiller(
-    bool separate_allocs_for_few_and_many_objects_spans,
-    MemoryModifyFunction unback)
+    HugePageFillerAllocsOption allocs_option, size_t chunks_per_alloc,
+    MemoryModifyFunction& unback)
     : HugePageFiller(Clock{.now = absl::base_internal::CycleClock::Now,
                            .freq = absl::base_internal::CycleClock::Frequency},
-                     separate_allocs_for_few_and_many_objects_spans, unback) {}
+                     allocs_option, chunks_per_alloc, unback) {}
 
 // For testing with mock clock
 template <class TrackerType>
 inline HugePageFiller<TrackerType>::HugePageFiller(
-    Clock clock, bool separate_allocs_for_few_and_many_objects_spans,
-    MemoryModifyFunction unback)
-    : separate_allocs_for_few_and_many_objects_spans_(
-          separate_allocs_for_few_and_many_objects_spans),
+    Clock clock, HugePageFillerAllocsOption allocs_option,
+    size_t chunks_per_alloc, MemoryModifyFunction& unback)
+    : chunks_per_alloc_(chunks_per_alloc),
+      allocs_for_sparse_and_dense_spans_(allocs_option),
       size_(NHugePages(0)),
       fillerstats_tracker_(clock, absl::Minutes(10), absl::Minutes(5)),
-      unback_(unback) {}
+      unback_(unback) {
+  ASSERT(chunks_per_alloc_ > 0 && chunks_per_alloc_ <= kChunks);
+}
 
 template <class TrackerType>
 inline typename HugePageFiller<TrackerType>::TryGetResult
-HugePageFiller<TrackerType>::TryGet(Length n, size_t num_objects) {
+HugePageFiller<TrackerType>::TryGet(Length n, SpanAllocInfo span_alloc_info) {
   ASSERT(n > Length(0));
 
   // How do we choose which hugepage to allocate from (among those with
@@ -1434,18 +721,19 @@ HugePageFiller<TrackerType>::TryGet(Length n, size_t num_objects) {
   TrackerType* pt;
 
   bool was_released = false;
-  const ObjectCount type =
-      ABSL_PREDICT_FALSE(separate_allocs_for_few_and_many_objects_spans_) &&
-              IsManyObjectsSpan(num_objects)
-          ? kMany
-          : kFew;
+  const AccessDensityPrediction type =
+      ABSL_PREDICT_TRUE(allocs_for_sparse_and_dense_spans_ ==
+                        HugePageFillerAllocsOption::kSeparateAllocs) &&
+              IsDenseSpan(span_alloc_info.density)
+          ? AccessDensityPrediction::kDense
+          : AccessDensityPrediction::kSparse;
   do {
     pt = regular_alloc_[type].GetLeast(ListFor(n, 0));
     if (pt) {
       ASSERT(!pt->donated());
       break;
     }
-    if (ABSL_PREDICT_TRUE(type == kFew)) {
+    if (ABSL_PREDICT_TRUE(type == AccessDensityPrediction::kSparse)) {
       pt = donated_alloc_.GetLeast(n.raw_num());
       if (pt) {
         break;
@@ -1472,22 +760,27 @@ HugePageFiller<TrackerType>::TryGet(Length n, size_t num_objects) {
   } while (false);
   ASSUME(pt != nullptr);
   ASSERT(pt->longest_free_range() >= n);
-  // type == kMany => pt->HasManyObjectsSpans().  This also verifies we do not
-  // end up with a donated pt on the kMany path.
-  ASSERT(type == kFew || pt->HasManyObjectsSpans());
+  // type == AccessDensityPrediction::kDense => pt->HasDenseSpans(). This
+  // also verifies we do not end up with a donated pt on the kDense path.
+  ASSERT(type == AccessDensityPrediction::kSparse || pt->HasDenseSpans());
   const auto page_allocation = pt->Get(n);
   AddToFillerList(pt);
   pages_allocated_[type] += n;
 
+  // If it was in a released state earlier, and is about to be full again,
+  // record that the state has been toggled back and update the stat counter.
+  if (was_released && !pt->released() && !pt->was_released()) {
+    pt->set_was_released(/*status=*/true);
+    ++n_was_released_[type];
+  }
   ASSERT(was_released || page_allocation.previously_unbacked == Length(0));
-  (void)was_released;
-  ASSERT(unmapped_ >= page_allocation.previously_unbacked);
+  TC_ASSERT_GE(unmapped_, page_allocation.previously_unbacked);
   unmapped_ -= page_allocation.previously_unbacked;
   // We're being used for an allocation, so we are no longer considered
   // donated by this point.
   ASSERT(!pt->donated());
   UpdateFillerStatsTracker();
-  return {pt, page_allocation.page};
+  return {pt, page_allocation.page, was_released};
 }
 
 // Marks [p, p + n) as usable by new allocations into *pt; returns pt
@@ -1496,16 +789,15 @@ HugePageFiller<TrackerType>::TryGet(Length n, size_t num_objects) {
 // {pt, p, n} was the result of a previous TryGet.
 template <class TrackerType>
 inline TrackerType* HugePageFiller<TrackerType>::Put(TrackerType* pt, PageId p,
-                                                     Length n,
-                                                     size_t num_objects) {
+                                                     Length n) {
   RemoveFromFillerList(pt);
   pt->Put(p, n);
-  if (pt->HasManyObjectsSpans()) {
-    ASSERT(pages_allocated_[kMany] >= n);
-    pages_allocated_[kMany] -= n;
+  if (pt->HasDenseSpans()) {
+    ASSERT(pages_allocated_[AccessDensityPrediction::kDense] >= n);
+    pages_allocated_[AccessDensityPrediction::kDense] -= n;
   } else {
-    ASSERT(pages_allocated_[kFew] >= n);
-    pages_allocated_[kFew] -= n;
+    ASSERT(pages_allocated_[AccessDensityPrediction::kSparse] >= n);
+    pages_allocated_[AccessDensityPrediction::kSparse] -= n;
   }
 
   if (pt->longest_free_range() == kPagesPerHugePage) {
@@ -1514,8 +806,8 @@ inline TrackerType* HugePageFiller<TrackerType>::Put(TrackerType* pt, PageId p,
     if (pt->released()) {
       const Length free_pages = pt->free_pages();
       const Length released_pages = pt->released_pages();
-      ASSERT(free_pages >= released_pages);
-      ASSERT(unmapped_ >= released_pages);
+      TC_ASSERT_GE(free_pages, released_pages);
+      TC_ASSERT_GE(unmapped_, released_pages);
       unmapped_ -= released_pages;
 
       if (free_pages > released_pages) {
@@ -1534,6 +826,15 @@ inline TrackerType* HugePageFiller<TrackerType>::Put(TrackerType* pt, PageId p,
       }
     }
 
+    if (pt->was_released()) {
+      pt->set_was_released(/*status=*/false);
+      if (pt->HasDenseSpans()) {
+        --n_was_released_[AccessDensityPrediction::kDense];
+      } else {
+        --n_was_released_[AccessDensityPrediction::kSparse];
+      }
+    }
+
     UpdateFillerStatsTracker();
     return pt;
   }
@@ -1543,26 +844,26 @@ inline TrackerType* HugePageFiller<TrackerType>::Put(TrackerType* pt, PageId p,
 }
 
 template <class TrackerType>
-inline void HugePageFiller<TrackerType>::Contribute(TrackerType* pt,
-                                                    bool donated,
-                                                    size_t num_objects) {
+inline void HugePageFiller<TrackerType>::Contribute(
+    TrackerType* pt, bool donated, SpanAllocInfo span_alloc_info) {
   // A contributed huge page should not yet be subreleased.
   ASSERT(pt->released_pages() == Length(0));
 
-  const ObjectCount type =
-      ABSL_PREDICT_FALSE(separate_allocs_for_few_and_many_objects_spans_) &&
-              IsManyObjectsSpan(num_objects)
-          ? kMany
-          : kFew;
+  const AccessDensityPrediction type =
+      ABSL_PREDICT_TRUE(allocs_for_sparse_and_dense_spans_ ==
+                        HugePageFillerAllocsOption::kSeparateAllocs) &&
+              IsDenseSpan(span_alloc_info.density)
+          ? AccessDensityPrediction::kDense
+          : AccessDensityPrediction::kSparse;
 
   pages_allocated_[type] += pt->used_pages();
-  ASSERT(!(type == kMany && donated));
+  ASSERT(!(type == AccessDensityPrediction::kDense && donated));
   if (donated) {
     ASSERT(pt->was_donated());
     DonateToFillerList(pt);
   } else {
-    if (type == kMany) {
-      pt->SetHasManyObjectsSpans();
+    if (type == AccessDensityPrediction::kDense) {
+      pt->SetHasDenseSpans();
     }
     AddToFillerList(pt);
   }
@@ -1626,7 +927,7 @@ inline Length HugePageFiller<TrackerType>::ReleaseCandidates(
 #endif
   for (int i = 0; i < candidates.size() && total_released < target; i++) {
     TrackerType* best = candidates[i];
-    ASSERT(best != nullptr);
+    TC_ASSERT_NE(best, nullptr);
 
     // Verify that we have pages that we can release.
     ASSERT(best->free_pages() != Length(0));
@@ -1666,10 +967,18 @@ inline Length HugePageFiller<TrackerType>::ReleaseCandidates(
 
 template <class TrackerType>
 inline Length HugePageFiller<TrackerType>::FreePagesInPartialAllocs() const {
-  return regular_alloc_partial_released_[kFew].size().in_pages() +
-         regular_alloc_partial_released_[kMany].size().in_pages() +
-         regular_alloc_released_[kFew].size().in_pages() +
-         regular_alloc_released_[kMany].size().in_pages() -
+  return regular_alloc_partial_released_[AccessDensityPrediction::kSparse]
+             .size()
+             .in_pages() +
+         regular_alloc_partial_released_[AccessDensityPrediction::kDense]
+             .size()
+             .in_pages() +
+         regular_alloc_released_[AccessDensityPrediction::kSparse]
+             .size()
+             .in_pages() +
+         regular_alloc_released_[AccessDensityPrediction::kDense]
+             .size()
+             .in_pages() -
          used_pages_in_any_subreleased() - unmapped_pages();
 }
 
@@ -1682,7 +991,7 @@ inline Length HugePageFiller<TrackerType>::GetDesiredSubreleasePages(
   // the recent *demand* requirement, i.e., if we have a large amount of free
   // memory right now but demand is below the requirement, we still want to
   // subrelease.
-  ASSERT(total_released < desired);
+  TC_ASSERT_LT(total_released, desired);
   if (!intervals.SkipSubreleaseEnabled()) {
     return desired;
   }
@@ -1755,7 +1064,9 @@ inline Length HugePageFiller<TrackerType>::ReleasePages(
     // unaccounted unmapped pages and release from partial allocs). Else, we aim
     // to release up to the total number of free pages in partially-released
     // allocs.
-    desired = std::max(desired, FreePagesInPartialAllocs());
+    size_t from_partial_allocs =
+        kPartialAllocPagesRelease * FreePagesInPartialAllocs().raw_num();
+    desired = std::max(desired, Length(from_partial_allocs));
   }
 
   // We also do eager release, once we've called this at least once:
@@ -1794,17 +1105,19 @@ inline Length HugePageFiller<TrackerType>::ReleasePages(
 
   while (total_released < desired) {
     CandidateArray candidates;
-    // We can skip the first chunks_per_tracker_list lists as they are known
+    // We can skip the first chunks_per_alloc_ lists as they are known
     // to be 100% full. (Those lists are likely to be long.)
     //
     // We do not examine the regular_alloc_released_ lists, as only contain
     // completely released pages.
-    int n_candidates =
-        SelectCandidates(absl::MakeSpan(candidates), 0,
-                         regular_alloc_partial_released_[kFew], kChunks);
-    n_candidates =
-        SelectCandidates(absl::MakeSpan(candidates), n_candidates,
-                         regular_alloc_partial_released_[kMany], kChunks);
+    int n_candidates = SelectCandidates(
+        absl::MakeSpan(candidates), 0,
+        regular_alloc_partial_released_[AccessDensityPrediction::kSparse],
+        chunks_per_alloc_);
+    n_candidates = SelectCandidates(
+        absl::MakeSpan(candidates), n_candidates,
+        regular_alloc_partial_released_[AccessDensityPrediction::kDense],
+        chunks_per_alloc_);
 
     Length released =
         ReleaseCandidates(absl::MakeSpan(candidates.data(), n_candidates),
@@ -1826,11 +1139,12 @@ inline Length HugePageFiller<TrackerType>::ReleasePages(
     // We select candidate hugepages from few_objects_alloc_ first as we expect
     // hugepages in this alloc to become free earlier than those in other
     // allocs.
-    int n_candidates =
-        SelectCandidates(absl::MakeSpan(candidates), /*current_candidates=*/0,
-                         regular_alloc_[kFew], kChunks);
-    n_candidates = SelectCandidates(absl::MakeSpan(candidates), n_candidates,
-                                    regular_alloc_[kMany], kChunks);
+    int n_candidates = SelectCandidates(
+        absl::MakeSpan(candidates), /*current_candidates=*/0,
+        regular_alloc_[AccessDensityPrediction::kSparse], chunks_per_alloc_);
+    n_candidates = SelectCandidates(
+        absl::MakeSpan(candidates), n_candidates,
+        regular_alloc_[AccessDensityPrediction::kDense], chunks_per_alloc_);
     // TODO(b/138864853): Perhaps remove donated_alloc_ from here, it's not a
     // great candidate for partial release.
     n_candidates = SelectCandidates(absl::MakeSpan(candidates), n_candidates,
@@ -1850,16 +1164,14 @@ inline Length HugePageFiller<TrackerType>::ReleasePages(
 
 template <class TrackerType>
 inline void HugePageFiller<TrackerType>::AddSpanStats(
-    SmallSpanStats* small, LargeSpanStats* large,
-    PageAgeHistograms* ages) const {
-  auto loop = [&](const TrackerType* pt) {
-    pt->AddSpanStats(small, large, ages);
-  };
+    SmallSpanStats* small, LargeSpanStats* large) const {
+  auto loop = [&](const TrackerType* pt) { pt->AddSpanStats(small, large); };
   // We can skip the first chunks_per_tracker_list lists as they are known to be
   // 100% full.
   donated_alloc_.Iter(loop, 0);
-  for (const ObjectCount type : {kMany, kFew}) {
-    regular_alloc_[type].Iter(loop, kChunks);
+  for (const AccessDensityPrediction type :
+       {AccessDensityPrediction::kDense, AccessDensityPrediction::kSparse}) {
+    regular_alloc_[type].Iter(loop, chunks_per_alloc_);
     regular_alloc_partial_released_[type].Iter(loop, 0);
     regular_alloc_released_[type].Iter(loop, 0);
   }
@@ -1882,13 +1194,13 @@ namespace huge_page_filler_internal {
 class UsageInfo {
  public:
   enum Type {
-    kFewObjectsRegular,
-    kManyObjectsRegular,
+    kSparseRegular,
+    kDenseRegular,
     kDonated,
-    kFewObjectsPartialReleased,
-    kManyObjectsPartialReleased,
-    kFewObjectsReleased,
-    kManyObjectsReleased,
+    kSparsePartialReleased,
+    kDensePartialReleased,
+    kSparseReleased,
+    kDenseReleased,
     kNumTypes
   };
 
@@ -1919,12 +1231,12 @@ class UsageInfo {
       bucket_bounds_[buckets_size_] = i;
       buckets_size_++;
     }
-    CHECK_CONDITION(buckets_size_ <= kBucketCapacity);
+    TC_CHECK_LE(buckets_size_, kBucketCapacity);
   }
 
   template <class TrackerType>
   void Record(const TrackerType* pt, Type which) {
-    ASSERT(which < kNumTypes);
+    TC_ASSERT_LT(which, kNumTypes);
     const Length free = kPagesPerHugePage - pt->used_pages();
     const Length lf = pt->longest_free_range();
     const size_t nalloc = pt->nallocs();
@@ -1980,7 +1292,7 @@ class UsageInfo {
   int BucketNum(size_t page) {
     auto it =
         std::upper_bound(bucket_bounds_, bucket_bounds_ + buckets_size_, page);
-    CHECK_CONDITION(it != bucket_bounds_);
+    TC_CHECK_NE(it, bucket_bounds_);
     return it - bucket_bounds_ - 1;
   }
 
@@ -2009,22 +1321,22 @@ class UsageInfo {
   }
 
   absl::string_view TypeToStr(Type type) const {
-    ASSERT(type < kNumTypes);
+    TC_ASSERT_LT(type, kNumTypes);
     switch (type) {
-      case kFewObjectsRegular:
-        return "few-object regular";
-      case kManyObjectsRegular:
-        return "many-object regular";
+      case kSparseRegular:
+        return "sparsely-accessed regular";
+      case kDenseRegular:
+        return "densely-accessed regular";
       case kDonated:
         return "donated";
-      case kFewObjectsPartialReleased:
-        return "few-object partial released";
-      case kManyObjectsPartialReleased:
-        return "many-object partial released";
-      case kFewObjectsReleased:
-        return "few-object released";
-      case kManyObjectsReleased:
-        return "many-object released";
+      case kSparsePartialReleased:
+        return "sparsely-accessed partial released";
+      case kDensePartialReleased:
+        return "densely-accessed partial released";
+      case kSparseReleased:
+        return "sparsely-accessed released";
+      case kDenseReleased:
+        return "densely-accessed released";
       default: {
         Crash(kCrash, __FILE__, __LINE__, "bad type", type);
         return "bad type";
@@ -2033,18 +1345,18 @@ class UsageInfo {
   }
 
   absl::string_view AllocType(Type type) const {
-    ASSERT(type < kNumTypes);
+    TC_ASSERT_LT(type, kNumTypes);
     switch (type) {
-      case kFewObjectsRegular:
-      case kManyObjectsRegular:
+      case kSparseRegular:
+      case kDenseRegular:
         return "REGULAR";
       case kDonated:
         return "DONATED";
-      case kFewObjectsPartialReleased:
-      case kManyObjectsPartialReleased:
+      case kSparsePartialReleased:
+      case kDensePartialReleased:
         return "PARTIAL";
-      case kFewObjectsReleased:
-      case kManyObjectsReleased:
+      case kSparseReleased:
+      case kDenseReleased:
         return "RELEASED";
       default: {
         Crash(kCrash, __FILE__, __LINE__, "bad type", type);
@@ -2054,17 +1366,17 @@ class UsageInfo {
   }
 
   absl::string_view ObjectType(Type type) const {
-    ASSERT(type < kNumTypes);
+    TC_ASSERT_LT(type, kNumTypes);
     switch (type) {
-      case kFewObjectsRegular:
+      case kSparseRegular:
       case kDonated:
-      case kFewObjectsPartialReleased:
-      case kFewObjectsReleased:
-        return "FEW_OBJECTS";
-      case kManyObjectsRegular:
-      case kManyObjectsPartialReleased:
-      case kManyObjectsReleased:
-        return "MANY_OBJECTS";
+      case kSparsePartialReleased:
+      case kSparseReleased:
+        return "SPARSELY_ACCESSED";
+      case kDenseRegular:
+      case kDensePartialReleased:
+      case kDenseReleased:
+        return "DENSELY_ACCESSED";
       default: {
         Crash(kCrash, __FILE__, __LINE__, "bad type", type);
         return "bad type";
@@ -2085,18 +1397,26 @@ template <class TrackerType>
 inline HugePageFillerStats HugePageFiller<TrackerType>::GetStats() const {
   HugePageFillerStats stats;
 
-  // note kChunks, not kNumLists here--we're iterating *full* lists.
-  for (size_t chunk = 0; chunk < kChunks; ++chunk) {
-    stats.n_full[kFew] += NHugePages(
-        regular_alloc_[kFew][ListFor(/*longest=*/Length(0), chunk)].length());
-    stats.n_full[kMany] += NHugePages(
-        regular_alloc_[kMany][ListFor(/*longest=*/Length(0), chunk)].length());
+  // note chunks_per_alloc_, not kNumLists here--we're iterating *full*
+  // lists.
+  for (size_t chunk = 0; chunk < chunks_per_alloc_; ++chunk) {
+    stats.n_full[AccessDensityPrediction::kSparse] +=
+        NHugePages(regular_alloc_[AccessDensityPrediction::kSparse]
+                                 [ListFor(/*longest=*/Length(0), chunk)]
+                                     .length());
+    stats.n_full[AccessDensityPrediction::kDense] +=
+        NHugePages(regular_alloc_[AccessDensityPrediction::kDense]
+                                 [ListFor(/*longest=*/Length(0), chunk)]
+                                     .length());
   }
-  stats.n_full[kObjectCounts] = stats.n_full[kFew] + stats.n_full[kMany];
+  stats.n_full[AccessDensityPrediction::kPredictionCounts] =
+      stats.n_full[AccessDensityPrediction::kSparse] +
+      stats.n_full[AccessDensityPrediction::kDense];
 
-  // We only use donated allocs for allocating few-object pages.
-  stats.n_total[kFew] = donated_alloc_.size();
-  for (const ObjectCount count : {kFew, kMany}) {
+  // We only use donated allocs for allocating sparse pages.
+  stats.n_total[AccessDensityPrediction::kSparse] = donated_alloc_.size();
+  for (const AccessDensityPrediction count :
+       {AccessDensityPrediction::kSparse, AccessDensityPrediction::kDense}) {
     stats.n_fully_released[count] = regular_alloc_released_[count].size();
     stats.n_partial_released[count] =
         regular_alloc_partial_released_[count].size();
@@ -2108,17 +1428,21 @@ inline HugePageFillerStats HugePageFiller<TrackerType>::GetStats() const {
         stats.n_total[count] - stats.n_released[count] - stats.n_full[count];
   }
 
-  // Collect total stats that is the sum of both kFew and kMany allocs.
-  stats.n_fully_released[kObjectCounts] =
-      stats.n_fully_released[kFew] + stats.n_fully_released[kMany];
-  stats.n_partial_released[kObjectCounts] =
-      stats.n_partial_released[kFew] + stats.n_partial_released[kMany];
-  stats.n_released[kObjectCounts] =
-      stats.n_released[kFew] + stats.n_released[kMany];
+  // Collect total stats that is the sum of both kSparse and kDense allocs.
+  stats.n_fully_released[AccessDensityPrediction::kPredictionCounts] =
+      stats.n_fully_released[AccessDensityPrediction::kSparse] +
+      stats.n_fully_released[AccessDensityPrediction::kDense];
+  stats.n_partial_released[AccessDensityPrediction::kPredictionCounts] =
+      stats.n_partial_released[AccessDensityPrediction::kSparse] +
+      stats.n_partial_released[AccessDensityPrediction::kDense];
+  stats.n_released[AccessDensityPrediction::kPredictionCounts] =
+      stats.n_released[AccessDensityPrediction::kSparse] +
+      stats.n_released[AccessDensityPrediction::kDense];
 
-  stats.n_total[kObjectCounts] = size();
-  stats.n_partial[kObjectCounts] =
-      size() - stats.n_released[kObjectCounts] - stats.n_full[kObjectCounts];
+  stats.n_total[AccessDensityPrediction::kPredictionCounts] = size();
+  stats.n_partial[AccessDensityPrediction::kPredictionCounts] =
+      size() - stats.n_released[AccessDensityPrediction::kPredictionCounts] -
+      stats.n_full[AccessDensityPrediction::kPredictionCounts];
   return stats;
 }
 
@@ -2140,31 +1464,38 @@ inline void HugePageFiller<TrackerType>::Print(Printer* out,
   out->printf(
       "HugePageFiller: Overall, %zu total, %zu full, %zu partial, %zu released "
       "(%zu partially), 0 quarantined\n",
-      size().raw_num(), stats.n_full[kObjectCounts].raw_num(),
-      stats.n_partial[kObjectCounts].raw_num(),
-      stats.n_released[kObjectCounts].raw_num(),
-      stats.n_partial_released[kObjectCounts].raw_num());
+      size().raw_num(),
+      stats.n_full[AccessDensityPrediction::kPredictionCounts].raw_num(),
+      stats.n_partial[AccessDensityPrediction::kPredictionCounts].raw_num(),
+      stats.n_released[AccessDensityPrediction::kPredictionCounts].raw_num(),
+      stats.n_partial_released[AccessDensityPrediction::kPredictionCounts]
+          .raw_num());
 
   out->printf(
-      "HugePageFiller: those with few objects, %zu total, %zu full, %zu "
-      "partial, %zu released (%zu partially), 0 quarantined\n",
-      stats.n_total[kFew].raw_num(), stats.n_full[kFew].raw_num(),
-      stats.n_partial[kFew].raw_num(), stats.n_released[kFew].raw_num(),
-      stats.n_partial_released[kFew].raw_num());
+      "HugePageFiller: those with sparsely-accessed spans, %zu total, "
+      "%zu full, %zu partial, %zu released (%zu partially), 0 quarantined\n",
+      stats.n_total[AccessDensityPrediction::kSparse].raw_num(),
+      stats.n_full[AccessDensityPrediction::kSparse].raw_num(),
+      stats.n_partial[AccessDensityPrediction::kSparse].raw_num(),
+      stats.n_released[AccessDensityPrediction::kSparse].raw_num(),
+      stats.n_partial_released[AccessDensityPrediction::kSparse].raw_num());
 
   out->printf(
-      "HugePageFiller: those with many objects, %zu total, %zu full, %zu "
-      "partial, %zu released (%zu partially), 0 quarantined\n",
-      stats.n_total[kMany].raw_num(), stats.n_full[kMany].raw_num(),
-      stats.n_partial[kMany].raw_num(), stats.n_released[kMany].raw_num(),
-      stats.n_partial_released[kMany].raw_num());
+      "HugePageFiller: those with densely-accessed spans, %zu total, "
+      "%zu full, %zu partial, %zu released (%zu partially), 0 quarantined\n",
+      stats.n_total[AccessDensityPrediction::kDense].raw_num(),
+      stats.n_full[AccessDensityPrediction::kDense].raw_num(),
+      stats.n_partial[AccessDensityPrediction::kDense].raw_num(),
+      stats.n_released[AccessDensityPrediction::kDense].raw_num(),
+      stats.n_partial_released[AccessDensityPrediction::kDense].raw_num());
 
   out->printf("HugePageFiller: %zu pages free in %zu hugepages, %.4f free\n",
               free_pages().raw_num(), size().raw_num(),
               safe_div(free_pages(), size().in_pages()));
 
   const HugeLength n_nonfull =
-      stats.n_partial[kObjectCounts] + stats.n_partial_released[kObjectCounts];
+      stats.n_partial[AccessDensityPrediction::kPredictionCounts] +
+      stats.n_partial_released[AccessDensityPrediction::kPredictionCounts];
   ASSERT(free_pages() <= n_nonfull.in_pages());
   out->printf("HugePageFiller: among non-fulls, %.4f free\n",
               safe_div(free_pages(), n_nonfull.in_pages()));
@@ -2177,10 +1508,16 @@ inline void HugePageFiller<TrackerType>::Print(Printer* out,
 
   out->printf(
       "HugePageFiller: %zu hugepages partially released, %.4f released\n",
-      stats.n_released[kObjectCounts].raw_num(),
-      safe_div(unmapped_pages(), stats.n_released[kObjectCounts].in_pages()));
+      stats.n_released[AccessDensityPrediction::kPredictionCounts].raw_num(),
+      safe_div(unmapped_pages(),
+               stats.n_released[AccessDensityPrediction::kPredictionCounts]
+                   .in_pages()));
   out->printf("HugePageFiller: %.4f of used pages hugepageable\n",
               hugepage_frac());
+  out->printf(
+      "HugePageFiller: %zu hugepages were previously released, but "
+      "later became full.\n",
+      previously_released_huge_pages().raw_num());
 
   // Subrelease
   out->printf(
@@ -2198,34 +1535,34 @@ inline void HugePageFiller<TrackerType>::Print(Printer* out,
   UsageInfo usage;
   donated_alloc_.Iter(
       [&](const TrackerType* pt) { usage.Record(pt, UsageInfo::kDonated); }, 0);
-  regular_alloc_[kFew].Iter(
+  regular_alloc_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsRegular);
+        usage.Record(pt, UsageInfo::kSparseRegular);
       },
       0);
-  regular_alloc_[kMany].Iter(
+  regular_alloc_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsRegular);
+        usage.Record(pt, UsageInfo::kDenseRegular);
       },
       0);
-  regular_alloc_partial_released_[kFew].Iter(
+  regular_alloc_partial_released_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsPartialReleased);
+        usage.Record(pt, UsageInfo::kSparsePartialReleased);
       },
       0);
-  regular_alloc_partial_released_[kMany].Iter(
+  regular_alloc_partial_released_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsPartialReleased);
+        usage.Record(pt, UsageInfo::kDensePartialReleased);
       },
       0);
-  regular_alloc_released_[kFew].Iter(
+  regular_alloc_released_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsReleased);
+        usage.Record(pt, UsageInfo::kSparseReleased);
       },
       0);
-  regular_alloc_released_[kMany].Iter(
+  regular_alloc_released_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsReleased);
+        usage.Record(pt, UsageInfo::kDenseReleased);
       },
       0);
 
@@ -2234,14 +1571,14 @@ inline void HugePageFiller<TrackerType>::Print(Printer* out,
   usage.Print(out);
 
   out->printf("\n");
-  fillerstats_tracker_.Print(out);
+  fillerstats_tracker_.Print(out, "HugePageFiller");
 }
 
 template <class TrackerType>
 inline void HugePageFiller<TrackerType>::PrintAllocStatsInPbtxt(
     absl::string_view field, PbtxtRegion* hpaa,
-    const HugePageFillerStats& stats, ObjectCount count) const {
-  ASSERT(count < ObjectCount::kObjectCounts);
+    const HugePageFillerStats& stats, AccessDensityPrediction count) const {
+  TC_ASSERT_LT(count, AccessDensityPrediction::kPredictionCounts);
   PbtxtRegion alloc_region = hpaa->CreateSubRegion(field);
   alloc_region.PrintI64("full_huge_pages", stats.n_full[count].raw_num());
   alloc_region.PrintI64("partial_huge_pages", stats.n_partial[count].raw_num());
@@ -2265,35 +1602,47 @@ inline void HugePageFiller<TrackerType>::PrintInPbtxt(PbtxtRegion* hpaa) const {
                                 static_cast<double>(b.raw_num());
   };
 
-  hpaa->PrintI64("filler_full_huge_pages",
-                 stats.n_full[kObjectCounts].raw_num());
-  hpaa->PrintI64("filler_partial_huge_pages",
-                 stats.n_partial[kObjectCounts].raw_num());
-  hpaa->PrintI64("filler_released_huge_pages",
-                 stats.n_released[kObjectCounts].raw_num());
-  hpaa->PrintI64("filler_partially_released_huge_pages",
-                 stats.n_partial_released[kObjectCounts].raw_num());
+  hpaa->PrintI64(
+      "filler_full_huge_pages",
+      stats.n_full[AccessDensityPrediction::kPredictionCounts].raw_num());
+  hpaa->PrintI64(
+      "filler_partial_huge_pages",
+      stats.n_partial[AccessDensityPrediction::kPredictionCounts].raw_num());
+  hpaa->PrintI64(
+      "filler_released_huge_pages",
+      stats.n_released[AccessDensityPrediction::kPredictionCounts].raw_num());
+  hpaa->PrintI64(
+      "filler_partially_released_huge_pages",
+      stats.n_partial_released[AccessDensityPrediction::kPredictionCounts]
+          .raw_num());
 
-  PrintAllocStatsInPbtxt("filler_few_object_alloc_stats", hpaa, stats,
-                         ObjectCount::kFew);
-  PrintAllocStatsInPbtxt("filler_many_object_alloc_stats", hpaa, stats,
-                         ObjectCount::kMany);
+  PrintAllocStatsInPbtxt("filler_sparsely_accessed_alloc_stats", hpaa, stats,
+                         AccessDensityPrediction::kSparse);
+  PrintAllocStatsInPbtxt("filler_densely_accessed_alloc_stats", hpaa, stats,
+                         AccessDensityPrediction::kDense);
 
   hpaa->PrintI64("filler_free_pages", free_pages().raw_num());
   hpaa->PrintI64("filler_used_pages_in_subreleased",
                  used_pages_in_any_subreleased().raw_num());
   hpaa->PrintI64("filler_used_pages_in_partial_released",
                  used_pages_in_partial_released().raw_num());
-  hpaa->PrintI64("filler_unmapped_bytes",
-                 static_cast<uint64_t>(
-                     stats.n_released[kObjectCounts].raw_num() *
-                     safe_div(unmapped_pages(),
-                              stats.n_released[kObjectCounts].in_pages())));
-  hpaa->PrintI64("filler_hugepageable_used_bytes",
-                 static_cast<uint64_t>(
-                     hugepage_frac() *
-                     static_cast<double>(pages_allocated_[kFew].in_bytes() +
-                                         pages_allocated_[kMany].in_bytes())));
+  hpaa->PrintI64(
+      "filler_unmapped_bytes",
+      static_cast<uint64_t>(
+          stats.n_released[AccessDensityPrediction::kPredictionCounts]
+              .raw_num() *
+          safe_div(unmapped_pages(),
+                   stats.n_released[AccessDensityPrediction::kPredictionCounts]
+                       .in_pages())));
+  hpaa->PrintI64(
+      "filler_hugepageable_used_bytes",
+      static_cast<uint64_t>(
+          hugepage_frac() *
+          static_cast<double>(
+              pages_allocated_[AccessDensityPrediction::kSparse].in_bytes() +
+              pages_allocated_[AccessDensityPrediction::kDense].in_bytes())));
+  hpaa->PrintI64("filler_previously_released_huge_pages",
+                 previously_released_huge_pages().raw_num());
   hpaa->PrintI64("filler_num_pages_subreleased",
                  subrelease_stats_.total_pages_subreleased.raw_num());
   hpaa->PrintI64("filler_num_hugepages_broken",
@@ -2309,56 +1658,59 @@ inline void HugePageFiller<TrackerType>::PrintInPbtxt(PbtxtRegion* hpaa) const {
   UsageInfo usage;
   donated_alloc_.Iter(
       [&](const TrackerType* pt) { usage.Record(pt, UsageInfo::kDonated); }, 0);
-  regular_alloc_[kFew].Iter(
+  regular_alloc_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsRegular);
+        usage.Record(pt, UsageInfo::kSparseRegular);
       },
       0);
-  regular_alloc_[kMany].Iter(
+  regular_alloc_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsRegular);
+        usage.Record(pt, UsageInfo::kDenseRegular);
       },
       0);
-  regular_alloc_partial_released_[kFew].Iter(
+  regular_alloc_partial_released_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsPartialReleased);
+        usage.Record(pt, UsageInfo::kSparsePartialReleased);
       },
       0);
-  regular_alloc_partial_released_[kMany].Iter(
+  regular_alloc_partial_released_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsPartialReleased);
+        usage.Record(pt, UsageInfo::kDensePartialReleased);
       },
       0);
-  regular_alloc_released_[kFew].Iter(
+  regular_alloc_released_[AccessDensityPrediction::kSparse].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kFewObjectsReleased);
+        usage.Record(pt, UsageInfo::kSparseReleased);
       },
       0);
-  regular_alloc_released_[kMany].Iter(
+  regular_alloc_released_[AccessDensityPrediction::kDense].Iter(
       [&](const TrackerType* pt) {
-        usage.Record(pt, UsageInfo::kManyObjectsReleased);
+        usage.Record(pt, UsageInfo::kDenseReleased);
       },
       0);
 
   usage.Print(hpaa);
 
-  fillerstats_tracker_.PrintInPbtxt(hpaa);
+  fillerstats_tracker_.PrintSubreleaseStatsInPbtxt(hpaa,
+                                                   "filler_skipped_subrelease");
+  fillerstats_tracker_.PrintTimeseriesStatsInPbtxt(hpaa,
+                                                   "filler_stats_timeseries");
 }
 
 template <class TrackerType>
 inline void HugePageFiller<TrackerType>::UpdateFillerStatsTracker() {
-  StatsTrackerType::FillerStats stats;
+  StatsTrackerType::SubreleaseStats stats;
   stats.num_pages = pages_allocated();
   stats.free_pages = free_pages();
   stats.unmapped_pages = unmapped_pages();
-  // TODO(b/271289285): Test that we do not omit kMany&&partial release
   stats.used_pages_in_subreleased_huge_pages =
-      n_used_released_[kMany] + n_used_released_[kFew] +
-      n_used_partial_released_[kMany] + n_used_partial_released_[kFew];
-  // TODO(b/271289285): Break out statistics for many and few into the full
-  // cross-product (many v. few) x (normal, partial release, fully released).
+      n_used_released_[AccessDensityPrediction::kDense] +
+      n_used_released_[AccessDensityPrediction::kSparse] +
+      n_used_partial_released_[AccessDensityPrediction::kDense] +
+      n_used_partial_released_[AccessDensityPrediction::kSparse];
   stats.huge_pages[StatsTrackerType::kDonated] = donated_alloc_.size();
-  for (const ObjectCount type : {kMany, kFew}) {
+  for (const AccessDensityPrediction type :
+       {AccessDensityPrediction::kDense, AccessDensityPrediction::kSparse}) {
     stats.huge_pages[StatsTrackerType::kRegular] += regular_alloc_[type].size();
     stats.huge_pages[StatsTrackerType::kPartialReleased] +=
         regular_alloc_partial_released_[type].size();
@@ -2384,26 +1736,29 @@ inline size_t HugePageFiller<TrackerType>::IndexFor(TrackerType* pt) const {
   const size_t neg_ceil_log = __builtin_clzl(2 * na - 1);
 
   // We want the same spread as neg_ceil_log, but spread over [0,
-  // kChunks) (clamped at the left edge) instead of [0, 64). So subtract off
-  // the difference (computed by forcing na=1 to kChunks - 1.)
-  const size_t kOffset = __builtin_clzl(1) - (kChunks - 1);
+  // chunks_per_alloc_) (clamped at the left edge) instead of [0, 64). So
+  // subtract off the difference (computed by forcing na=1 to
+  // chunks_per_alloc_ - 1.)
+  const size_t kOffset = __builtin_clzl(1) - (chunks_per_alloc_ - 1);
   const size_t i = std::max(neg_ceil_log, kOffset) - kOffset;
-  ASSERT(i < kChunks);
+  TC_ASSERT_LT(i, chunks_per_alloc_);
+  TC_ASSERT_LT(i, kChunks);
   return i;
 }
 
 template <class TrackerType>
 inline size_t HugePageFiller<TrackerType>::ListFor(const Length longest,
                                                    const size_t chunk) const {
-  ASSERT(chunk < kChunks);
-  ASSERT(longest < kPagesPerHugePage);
-  return longest.raw_num() * kChunks + chunk;
+  TC_ASSERT_LT(chunk, kChunks);
+  TC_ASSERT_LT(chunk, chunks_per_alloc_);
+  TC_ASSERT_LT(longest, kPagesPerHugePage);
+  return longest.raw_num() * chunks_per_alloc_ + chunk;
 }
 
 template <class TrackerType>
 inline void HugePageFiller<TrackerType>::RemoveFromFillerList(TrackerType* pt) {
   Length longest = pt->longest_free_range();
-  ASSERT(longest < kPagesPerHugePage);
+  TC_ASSERT_LT(longest, kPagesPerHugePage);
 
   if (pt->donated()) {
     donated_alloc_.Remove(pt, longest.raw_num());
@@ -2412,11 +1767,12 @@ inline void HugePageFiller<TrackerType>::RemoveFromFillerList(TrackerType* pt) {
 
   size_t chunk = IndexFor(pt);
   size_t i = ListFor(longest, chunk);
-  const ObjectCount type =
-      ABSL_PREDICT_FALSE(separate_allocs_for_few_and_many_objects_spans_) &&
-              pt->HasManyObjectsSpans()
-          ? kMany
-          : kFew;
+  const AccessDensityPrediction type =
+      ABSL_PREDICT_TRUE(allocs_for_sparse_and_dense_spans_ ==
+                        HugePageFillerAllocsOption::kSeparateAllocs) &&
+              pt->HasDenseSpans()
+          ? AccessDensityPrediction::kDense
+          : AccessDensityPrediction::kSparse;
 
   if (!pt->released()) {
     regular_alloc_[type].Remove(pt, i);
@@ -2435,7 +1791,7 @@ template <class TrackerType>
 inline void HugePageFiller<TrackerType>::AddToFillerList(TrackerType* pt) {
   size_t chunk = IndexFor(pt);
   Length longest = pt->longest_free_range();
-  ASSERT(longest < kPagesPerHugePage);
+  TC_ASSERT_LT(longest, kPagesPerHugePage);
 
   // Once a donated alloc is used in any way, it degenerates into being a
   // regular alloc. This allows the algorithm to keep using it (we had to be
@@ -2444,11 +1800,12 @@ inline void HugePageFiller<TrackerType>::AddToFillerList(TrackerType* pt) {
   pt->set_donated(false);
 
   size_t i = ListFor(longest, chunk);
-  const ObjectCount type =
-      ABSL_PREDICT_FALSE(separate_allocs_for_few_and_many_objects_spans_) &&
-              pt->HasManyObjectsSpans()
-          ? kMany
-          : kFew;
+  const AccessDensityPrediction type =
+      ABSL_PREDICT_TRUE(allocs_for_sparse_and_dense_spans_ ==
+                        HugePageFillerAllocsOption::kSeparateAllocs) &&
+              pt->HasDenseSpans()
+          ? AccessDensityPrediction::kDense
+          : AccessDensityPrediction::kSparse;
 
   if (!pt->released()) {
     regular_alloc_[type].Add(pt, i);
@@ -2464,7 +1821,7 @@ inline void HugePageFiller<TrackerType>::AddToFillerList(TrackerType* pt) {
 template <class TrackerType>
 inline void HugePageFiller<TrackerType>::DonateToFillerList(TrackerType* pt) {
   Length longest = pt->longest_free_range();
-  ASSERT(longest < kPagesPerHugePage);
+  TC_ASSERT_LT(longest, kPagesPerHugePage);
 
   // We should never be donating already-released trackers!
   ASSERT(!pt->released());
@@ -2480,14 +1837,14 @@ inline double HugePageFiller<TrackerType>::hugepage_frac() const {
   // just the difference:
   const Length used = used_pages();
   const Length used_on_rel = used_pages_in_any_subreleased();
-  ASSERT(used >= used_on_rel);
+  TC_ASSERT_GE(used, used_on_rel);
   const Length used_on_huge = used - used_on_rel;
 
   const Length denom = used > Length(0) ? used : Length(1);
   const double ret =
       static_cast<double>(used_on_huge.raw_num()) / denom.raw_num();
-  ASSERT(ret >= 0);
-  ASSERT(ret <= 1);
+  TC_ASSERT_GE(ret, 0);
+  TC_ASSERT_LE(ret, 1);
   return std::clamp<double>(ret, 0, 1);
 }
 

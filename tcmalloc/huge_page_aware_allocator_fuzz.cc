@@ -14,38 +14,51 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/time/time.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/huge_page_aware_allocator.h"
-#include "tcmalloc/lifetime_based_allocator.h"
+#include "tcmalloc/huge_page_filler.h"
+#include "tcmalloc/huge_pages.h"
+#include "tcmalloc/huge_region.h"
+#include "tcmalloc/internal/allocation_guard.h"
+#include "tcmalloc/internal/logging.h"
+#include "tcmalloc/mock_huge_page_static_forwarder.h"
 #include "tcmalloc/pages.h"
 #include "tcmalloc/sizemap.h"
 #include "tcmalloc/span.h"
+#include "tcmalloc/stats.h"
 
 namespace {
+using tcmalloc::tcmalloc_internal::AccessDensityPrediction;
 using tcmalloc::tcmalloc_internal::BackingStats;
-using tcmalloc::tcmalloc_internal::HugePageAwareAllocator;
+using tcmalloc::tcmalloc_internal::HugePageFillerAllocsOption;
+using tcmalloc::tcmalloc_internal::HugeRegionUsageOption;
 using tcmalloc::tcmalloc_internal::kMaxSize;
 using tcmalloc::tcmalloc_internal::kMinObjectsToMove;
 using tcmalloc::tcmalloc_internal::kNumaPartitions;
 using tcmalloc::tcmalloc_internal::kPagesPerHugePage;
 using tcmalloc::tcmalloc_internal::kTop;
 using tcmalloc::tcmalloc_internal::Length;
-using tcmalloc::tcmalloc_internal::LifetimePredictionOptions;
 using tcmalloc::tcmalloc_internal::MemoryTag;
-using tcmalloc::tcmalloc_internal::pageheap_lock;
+using tcmalloc::tcmalloc_internal::PageHeapSpinLockHolder;
 using tcmalloc::tcmalloc_internal::PbtxtRegion;
 using tcmalloc::tcmalloc_internal::Printer;
 using tcmalloc::tcmalloc_internal::SizeMap;
 using tcmalloc::tcmalloc_internal::Span;
+using tcmalloc::tcmalloc_internal::SpanAllocInfo;
+using tcmalloc::tcmalloc_internal::huge_page_allocator_internal::
+    FakeStaticForwarder;
+using tcmalloc::tcmalloc_internal::huge_page_allocator_internal::
+    HugePageAwareAllocator;
 using tcmalloc::tcmalloc_internal::huge_page_allocator_internal::
     HugePageAwareAllocatorOptions;
-using tcmalloc::tcmalloc_internal::huge_page_allocator_internal::
-    HugeRegionCountOption;
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
@@ -58,14 +71,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
   }
 
+#if ABSL_HAVE_ADDRESS_SANITIZER
+  // Since asan introduces runtime overhead, limit size of fuzz targets further.
+  if (size > 10000) {
+    return 0;
+  }
+#endif
+
   // We interpret data as a small DSL for exploring the state space of
   // HugePageAwareAllocator.
   //
   // [0] - Memory tag.
   // [1] - HugeRegionsMode.
-  // [2] - Lifetime allocator options: Mode.
-  // [3] - Lifetime allocator options: Strategy.
-  // [4] - Lifetime allocator options: Short-lived threshold.
+  // [2:4] - Reserved.
   // [5] - Determine if we use separate filler allocs based on number of
   // objects per span.
   // [6:12] - Reserved.
@@ -89,24 +107,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             ? MemoryTag::kNormalP0
             : tag;
 
-  HugeRegionCountOption huge_region_option =
-      data[1] >= 128 ? HugeRegionCountOption::kSlack
-                     : HugeRegionCountOption::kAbandonedCount;
+  const HugeRegionUsageOption huge_region_option =
+      data[1] >= 128 ? HugeRegionUsageOption::kDefault
+                     : HugeRegionUsageOption::kUseForAllLargeAllocs;
 
-  // Initialize lifetime-aware allocator.
-  LifetimePredictionOptions::Mode mode =
-      data[2] < 85
-          ? LifetimePredictionOptions::Mode::kEnabled
-          : (data[2] < 170 ? LifetimePredictionOptions::Mode::kDisabled
-                           : LifetimePredictionOptions::Mode::kCounterfactual);
-
-  LifetimePredictionOptions::Strategy strategy =
-      data[3] >= 128
-          ? LifetimePredictionOptions::Strategy::kAlwaysShortLivedRegions
-          : LifetimePredictionOptions::Strategy::kPredictedLifetimeRegions;
-  absl::Duration lifetime_duration = absl::Milliseconds(data[4]);
-  LifetimePredictionOptions lifetime_options(mode, strategy, lifetime_duration);
-  const bool separate_allocs_for_few_and_many_objects_spans = data[5];
+  const HugePageFillerAllocsOption allocs_option =
+      data[5] >= 128 ? HugePageFillerAllocsOption::kUnifiedAllocs
+                     : HugePageFillerAllocsOption::kSeparateAllocs;
 
   // data[6:12] - Reserve additional bytes for any features we might want to add
   // in the future.
@@ -115,15 +122,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   // HugePageAwareAllocator can't be destroyed cleanly, so we store a pointer
   // to one and construct in place.
-  void* p = malloc(sizeof(HugePageAwareAllocator));
+  void* p = malloc(sizeof(HugePageAwareAllocator<FakeStaticForwarder>));
   HugePageAwareAllocatorOptions options;
   options.tag = tag;
   options.use_huge_region_more_often = huge_region_option;
-  options.lifetime_options = lifetime_options;
-  options.separate_allocs_for_few_and_many_objects_spans =
-      separate_allocs_for_few_and_many_objects_spans;
-  HugePageAwareAllocator* allocator;
-  allocator = new (p) HugePageAwareAllocator(options);
+  options.allocs_for_sparse_and_dense_spans = allocs_option;
+  HugePageAwareAllocator<FakeStaticForwarder>* allocator;
+  allocator = new (p) HugePageAwareAllocator<FakeStaticForwarder>(options);
+  auto& forwarder = allocator->forwarder();
 
   struct SpanInfo {
     Span* span;
@@ -132,10 +138,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   std::vector<SpanInfo> allocs;
   Length allocated;
 
-  // TODO(b/271282540): Add an additional op that simulates a failure for
-  // Unback when releasing spans.
-  //
-  // TODO(b/242550501): Use mocks to change runtime parameters while running.
   for (size_t i = 0; i + 9 <= size; i += 9) {
     const uint16_t op = data[i];
     uint64_t value;
@@ -150,31 +152,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // to allocate.
         // value[32:47] - Alignment.
         // value[48] - Should we use aligned allocate?
-        // value[63:49] - Reserved.
+        // value[49] - Is the span sparsely- or densely-accessed?
+        // value[63:50] - Reserved.
         const Length length(std::clamp<size_t>(
             value & 0xFFFF, 1, kPagesPerHugePage.raw_num() - 1));
         size_t num_objects = std::max<size_t>((value >> 16) & 0xFFFF, 1);
         size_t object_size = length.in_bytes() / num_objects;
+        const bool use_aligned = ((value >> 48) & 0x1) == 0;
+        const Length align(
+            use_aligned ? std::clamp<size_t>((value >> 32) & 0xFFFF, 1,
+                                             kPagesPerHugePage.raw_num() - 1)
+                        : 1);
 
-        if (object_size > kMaxSize) {
+        AccessDensityPrediction density = ((value >> 49) & 0x1) == 0
+                                              ? AccessDensityPrediction::kSparse
+                                              : AccessDensityPrediction::kDense;
+        if (object_size > kMaxSize || align > Length(1)) {
           // Truncate to a single object.
           num_objects = 1;
+          // TODO(b/283843066): Revisit this once we have fluid partitioning.
+          density = AccessDensityPrediction::kSparse;
         } else if (!SizeMap::IsValidSizeClass(object_size, length.raw_num(),
                                               kMinObjectsToMove)) {
           // This is an invalid size class, so skip it.
           break;
         }
 
-        const bool use_aligned = ((value >> 48) & 0x1) == 0;
-        Span* s;
-        if (use_aligned) {
-          const Length align(std::clamp<size_t>(
-              (value >> 32) & 0xFFFF, 1, kPagesPerHugePage.raw_num() - 1));
-          s = allocator->NewAligned(length, align, num_objects);
-        } else {
-          s = allocator->New(length, num_objects);
+        // Allocation is too big for filler if we try to allocate >
+        // kPagesPerHugePage / 2 run of pages. The allocations may go to
+        // HugeRegion and that might lead to donations with kSparse density.
+        if (length > kPagesPerHugePage / 2) {
+          density = AccessDensityPrediction::kSparse;
         }
-        CHECK_CONDITION(s != nullptr);
+
+        Span* s;
+        SpanAllocInfo alloc_info = {.objects_per_span = num_objects,
+                                    .density = density};
+        if (use_aligned) {
+          s = allocator->NewAligned(length, align, alloc_info);
+        } else {
+          s = allocator->New(length, alloc_info);
+        }
+        TC_CHECK_NE(s, nullptr);
         CHECK_GE(s->num_pages().raw_num(), length.raw_num());
 
         allocs.push_back(SpanInfo{s, num_objects});
@@ -195,7 +214,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         allocs.resize(allocs.size() - 1);
         allocated -= span_info.span->num_pages();
         {
-          absl::base_internal::SpinLockHolder h(&pageheap_lock);
+          PageHeapSpinLockHolder l;
           allocator->Delete(span_info.span, span_info.objects_per_span);
         }
         break;
@@ -207,7 +226,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // value[63:8] - Reserved.
         Length desired(value & 0x00FF);
         {
-          absl::base_internal::SpinLockHolder h(&pageheap_lock);
+          PageHeapSpinLockHolder l;
           allocator->ReleaseAtLeastNPages(desired);
         }
         break;
@@ -216,18 +235,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // Release pages by breaking hugepages.  We divide up our random value
         // by:
         //
-        // value[7:0] - Choose number of pages to release.
-        // value[63:8] - Reserved.
-        Length desired(value & 0x00FF);
+        // value[15:0] - Choose number of pages to release.
+        // value[63:16] - Reserved.
+        Length desired(value & 0xFFFF);
         Length released;
-        BackingStats stats;
+        size_t releasable_bytes;
         {
-          absl::base_internal::SpinLockHolder h(&pageheap_lock);
-          stats = allocator->FillerStats();
+          PageHeapSpinLockHolder l;
+          releasable_bytes = allocator->FillerStats().free_bytes +
+                             allocator->RegionsFreeBacked().in_bytes();
           released = allocator->ReleaseAtLeastNPagesBreakingHugepages(desired);
         }
-        CHECK_GE(released.in_bytes(),
-                 std::min(desired.in_bytes(), stats.free_bytes));
+
+        if (forwarder.release_succeeds()) {
+          CHECK_GE(released.in_bytes(),
+                   std::min(desired.in_bytes(), releasable_bytes));
+        } else {
+          // TODO(b/271282540):  This is not strict equality due to
+          // HugePageFiller's unmapping_unaccounted_ state.  Narrow this bound.
+          CHECK_GE(released.in_bytes(), 0);
+        }
         break;
       }
       case 4: {
@@ -259,7 +286,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // value is unused.
         BackingStats stats;
         {
-          absl::base_internal::SpinLockHolder h(&pageheap_lock);
+          PageHeapSpinLockHolder l;
           stats = allocator->stats();
         }
         uint64_t used_bytes =
@@ -267,12 +294,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         CHECK_EQ(used_bytes, allocated.in_bytes());
         break;
       }
+      case 7: {
+        // Change a runtime parameter.
+        //
+        // value[0:2] - Select parameter
+        // value[3:7] - Reserved
+        // value[8:63] - The value
+        const uint64_t actual_value = value >> 8;
+        switch (value & 0x7) {
+          case 0:
+            forwarder.set_filler_skip_subrelease_interval(
+                absl::Nanoseconds(actual_value));
+            forwarder.set_filler_skip_subrelease_short_interval(
+                absl::ZeroDuration());
+            forwarder.set_filler_skip_subrelease_long_interval(
+                absl::ZeroDuration());
+            break;
+          case 1:
+            forwarder.set_filler_skip_subrelease_interval(absl::ZeroDuration());
+            forwarder.set_filler_skip_subrelease_short_interval(
+                absl::Nanoseconds(actual_value));
+            break;
+          case 2:
+            forwarder.set_filler_skip_subrelease_interval(absl::ZeroDuration());
+            forwarder.set_filler_skip_subrelease_long_interval(
+                absl::Nanoseconds(actual_value));
+            break;
+          case 3:
+            forwarder.set_release_partial_alloc_pages(actual_value & 0x1);
+            break;
+          case 4:
+            forwarder.set_hpaa_subrelease(actual_value & 0x1);
+            break;
+          case 5:
+            forwarder.set_release_succeeds(actual_value & 0x1);
+            break;
+        }
+
+        break;
+      }
     }
   }
 
   // Clean up.
   for (auto span_info : allocs) {
-    absl::base_internal::SpinLockHolder h(&pageheap_lock);
+    PageHeapSpinLockHolder l;
     allocated -= span_info.span->num_pages();
     allocator->Delete(span_info.span, span_info.objects_per_span);
   }

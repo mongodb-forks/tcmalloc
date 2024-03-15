@@ -17,13 +17,15 @@
 
 #include <stddef.h>
 
+#include <new>
+
 #include "absl/base/attributes.h"
 #include "absl/base/dynamic_annotations.h"
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
 #include "tcmalloc/arena.h"
 #include "tcmalloc/common.h"
-#include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/config.h"
 
 #ifdef ABSL_HAVE_ADDRESS_SANITIZER
 #include <sanitizer/asan_interface.h>
@@ -64,7 +66,10 @@ class PageHeapAllocator {
     stats_.in_use++;
     if (ABSL_PREDICT_FALSE(result == nullptr)) {
       stats_.total++;
-      return reinterpret_cast<T*>(arena_->Alloc(sizeof(T)));
+      result = reinterpret_cast<T*>(
+          arena_->Alloc(sizeof(T), static_cast<std::align_val_t>(alignof(T))));
+      ABSL_ANNOTATE_MEMORY_IS_UNINITIALIZED(result, sizeof(*result));
+      return result;
     } else {
 #ifdef ABSL_HAVE_ADDRESS_SANITIZER
       // Unpoison the object on the freelist.

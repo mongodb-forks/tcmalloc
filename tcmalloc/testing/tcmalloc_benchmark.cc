@@ -14,6 +14,11 @@
 
 #include <malloc.h>
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <string>
@@ -23,6 +28,7 @@
 #include "absl/base/attributes.h"
 #include "absl/random/random.h"
 #include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "benchmark/benchmark.h"
 #include "tcmalloc/common.h"
@@ -88,18 +94,42 @@ static void BM_aligned_new(benchmark::State& state) {
     operator delete(ptr, size, static_cast<std::align_val_t>(alignment));
   }
 }
-BENCHMARK(BM_aligned_new)->RangePair(1, 1 << 20, 8, 64);
+BENCHMARK(BM_aligned_new)->RangePair(1, 1 << 20, 8, 64)->ArgPair(65, 64);
+
+static void BM_new_delete_slow_path(benchmark::State& state) {
+  // The benchmark is intended to cover CpuCache overflow/underflow paths,
+  // transfer cache and a bit of the central freelist.
+  std::vector<void*> allocs((4 << 10) + 128);
+  const size_t size = state.range(0);
+  for (auto s : state) {
+    for (void*& p : allocs) {
+      p = ::operator new(size);
+    }
+    for (void* p : allocs) {
+      ::operator delete(p, size);
+    }
+  }
+}
+BENCHMARK(BM_new_delete_slow_path)->Arg(8)->Arg(8192);
+
+static void BM_new_delete_transfer_cache(benchmark::State& state) {
+  // The benchmark is intended to cover CpuCache overflow/underflow paths
+  // and transfer cache.
+  constexpr size_t kSize = 256;
+  std::vector<void*> allocs(512);
+  for (auto s : state) {
+    for (void*& p : allocs) {
+      p = ::operator new(kSize);
+    }
+    for (void* p : allocs) {
+      ::operator delete(p, kSize);
+    }
+  }
+}
+BENCHMARK(BM_new_delete_transfer_cache);
 
 static void* malloc_pages(size_t pages) {
-#if defined(TCMALLOC_256K_PAGES)
-  static const size_t kPageSize = 256 * 1024;
-#elif defined(TCMALLOC_LARGE_PAGES)
-  static const size_t kPageSize = 32 * 1024;
-#elif defined(TCMALLOC_SMALL_BUT_SLOW)
-  static const size_t kPageSize = 4096;
-#else
-  static const size_t kPageSize = 8192;
-#endif
+  using tcmalloc::tcmalloc_internal::kPageSize;
   size_t size = pages * kPageSize;
   void* ptr = memalign(kPageSize, size);
   return ptr;

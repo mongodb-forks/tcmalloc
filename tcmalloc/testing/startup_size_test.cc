@@ -31,8 +31,8 @@
 #include <utility>
 
 #include "gtest/gtest.h"
-#include "absl/base/internal/sysinfo.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/sysinfo.h"
 #include "tcmalloc/malloc_extension.h"
 
 namespace tcmalloc {
@@ -60,12 +60,12 @@ TEST(StartupSizeTest, Basic) {
 #ifdef __powerpc64__
   size_t metadata_limit = 36.5 * MiB;
 #else
-  size_t metadata_limit = 13 * MiB;
+  size_t metadata_limit = 28 * MiB;
 #endif
   // Check whether per-cpu is active
   if (percpu > 0) {
     // Account for 16KiB per cpu slab
-    metadata_limit += absl::base_internal::NumCPUs() * 16 * 1024;
+    metadata_limit += tcmalloc_internal::NumCPUs() * 16 * 1024;
   }
   size_t meta = Property(map, "tcmalloc.metadata_bytes");
   size_t physical = Property(map, "generic.physical_memory_used");

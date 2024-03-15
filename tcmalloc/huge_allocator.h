@@ -20,9 +20,10 @@
 #include <stddef.h>
 
 #include "absl/base/attributes.h"
-#include "tcmalloc/common.h"
 #include "tcmalloc/huge_address_map.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/internal/config.h"
+#include "tcmalloc/internal/logging.h"
 #include "tcmalloc/metadata_allocator.h"
 #include "tcmalloc/stats.h"
 #include "tcmalloc/system-alloc.h"
@@ -72,8 +73,7 @@ class HugeAllocator {
   // Unused memory in the allocator.
   HugeLength size() const { return from_system_ - in_use_; }
 
-  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large,
-                    PageAgeHistograms* ages) const;
+  void AddSpanStats(SmallSpanStats* small, LargeSpanStats* large) const;
 
   BackingStats stats() const {
     BackingStats s;

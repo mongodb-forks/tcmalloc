@@ -15,18 +15,80 @@
 #include "tcmalloc/sizemap.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <new>
 
-#include "tcmalloc/experiment.h"
-#include "tcmalloc/internal/environment.h"
-#include "tcmalloc/internal/optimization.h"
+#include "absl/base/macros.h"
+#include "absl/types/span.h"
+#include "tcmalloc/common.h"
+#include "tcmalloc/huge_page_aware_allocator.h"
+#include "tcmalloc/internal/config.h"
+#include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/sampled_allocation.h"
 #include "tcmalloc/pages.h"
-#include "tcmalloc/sampler.h"
+#include "tcmalloc/size_class_info.h"
 #include "tcmalloc/span.h"
+#include "tcmalloc/static_vars.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
+
+const SizeClasses& SizeMap::CurrentClasses() {
+  switch (Static::size_class_configuration()) {
+    case SizeClassConfiguration::kPow2Below64:
+      return kSizeClasses;
+    case SizeClassConfiguration::kPow2Only:
+      return kExperimentalPow2SizeClasses;
+    case SizeClassConfiguration::kLowFrag:
+      return kLowFragSizeClasses;
+    case SizeClassConfiguration::kLegacy:
+      // TODO(b/242710633): remove this opt out.
+      return kLegacySizeClasses;
+  }
+  TC_BUG("unreachable");
+}
+
+void SizeMap::CheckAssumptions() {
+  bool failed = false;
+  auto a = CurrentClasses().assumptions;
+  if (a.has_expanded_classes != kHasExpandedClasses) {
+    fprintf(stderr, "kHasExpandedClasses: assumed %d, actual %d\n",
+            a.has_expanded_classes, kHasExpandedClasses);
+    failed = true;
+  }
+  if (a.span_size != sizeof(Span)) {
+    fprintf(stderr, "sizeof(Span): assumed %zu, actual %zu\n", a.span_size,
+            sizeof(Span));
+    failed = true;
+  }
+  if (a.sampling_rate != kDefaultProfileSamplingRate) {
+    fprintf(stderr, "kDefaultProfileSamplingRate: assumed %zu, actual %zu\n",
+            a.sampling_rate, kDefaultProfileSamplingRate);
+    failed = true;
+  }
+  if (a.large_size != SizeMap::kLargeSize) {
+    fprintf(stderr, "SizeMap::kLargeSize: assumed %zu, actual %u\n",
+            a.large_size, SizeMap::kLargeSize);
+    failed = true;
+  }
+  if (a.large_size_alignment != SizeMap::kLargeSizeAlignment) {
+    fprintf(stderr, "SizeMap::kLargeSizeAlignment: assumed %zu, actual %u\n",
+            a.large_size_alignment, SizeMap::kLargeSizeAlignment);
+    failed = true;
+  }
+  if (failed) {
+    fprintf(stderr, "*************************************\n");
+    fprintf(stderr, "* MISMATCHED SIZE CLASS ASSUMPTIONS *\n");
+    fprintf(stderr, "*************************************\n");
+  }
+}
+
+extern "C" void TCMallocInternalCheckSizeClassAssumptions() {
+  SizeMap::CheckAssumptions();
+}
 
 bool SizeMap::IsValidSizeClass(size_t size, size_t pages,
                                size_t num_objects_to_move) {
@@ -38,37 +100,42 @@ bool SizeMap::IsValidSizeClass(size_t size, size_t pages,
     Log(kLog, __FILE__, __LINE__, "size class too big", size, kMaxSize);
     return false;
   }
-  // Check required alignment
-  size_t alignment = 128;
-  if (size <= kMultiPageSize) {
-    alignment = static_cast<size_t>(kAlignment);
-  } else if (size <= SizeMap::kMaxSmallSize) {
-    alignment = kMultiPageAlignment;
-  }
-  if ((size & (alignment - 1)) != 0) {
-    Log(kLog, __FILE__, __LINE__, "Not aligned properly", size, alignment);
+  // Verify Span does not use intrusive list which triggers memory accesses
+  // for sizes suitable for cold classes.
+  if (size >= kMinAllocSizeForCold && !Span::IsNonIntrusive(size)) {
+    Log(kLog, __FILE__, __LINE__,
+        "size is suitable for cold classes but is intrusive", size);
     return false;
   }
-  if (size <= kMultiPageSize && pages != 1) {
-    Log(kLog, __FILE__, __LINE__, "Multiple pages not allowed", size, pages,
-        kMultiPageSize);
+  // Check required alignment
+  const size_t alignment = size > SizeMap::kLargeSize
+                               ? kLargeSizeAlignment
+                               : static_cast<size_t>(kAlignment);
+  if ((size & (alignment - 1)) != 0) {
+    Log(kLog, __FILE__, __LINE__, "Not aligned properly", size, alignment);
     return false;
   }
   if (pages == 0) {
     Log(kLog, __FILE__, __LINE__, "pages should not be 0", pages);
     return false;
   }
-  if (pages >= 256) {
-    Log(kLog, __FILE__, __LINE__, "pages limited to 255", pages);
+  if (pages >= 255) {
+    Log(kLog, __FILE__, __LINE__, "pages limited to 254", pages);
     return false;
   }
   const size_t objects_per_span = Length(pages).in_bytes() / size;
   if (objects_per_span < 1) {
     Log(kLog, __FILE__, __LINE__, "each span must have at least one object");
     return false;
-  } else if (size >= kBitmapMinObjectSize && objects_per_span > 64) {
-    Log(kLog, __FILE__, __LINE__, "too many objects for bitmap representation",
-        size, objects_per_span);
+  }
+  if (!Span::IsValidSizeClass(size, pages)) {
+    Log(kLog, __FILE__, __LINE__, "span size class assumptions are broken",
+        size, pages, objects_per_span);
+    return false;
+  }
+  if (!HugePageAwareAllocator::IsValidSizeClass(size, pages)) {
+    Log(kLog, __FILE__, __LINE__, "hpaa size class assumptions are broken",
+        size, pages, objects_per_span);
     return false;
   }
   if (num_objects_to_move < 2) {
@@ -100,6 +167,7 @@ bool SizeMap::SetSizeClasses(absl::Span<const SizeClassInfo> size_classes) {
     class_to_size_[curr] = size_classes[c].size;
     class_to_pages_[curr] = size_classes[c].pages;
     num_objects_to_move_[curr] = size_classes[c].num_to_move;
+    max_capacity_[curr] = size_classes[c].max_capacity;
     ++curr;
   }
 
@@ -197,28 +265,12 @@ bool SizeMap::Init(absl::Span<const SizeClassInfo> size_classes) {
     }
   }
 
-  if (!kHasExpandedClasses) {
+  if (!ColdFeatureActive()) {
     return true;
   }
 
   memset(cold_sizes_, 0, sizeof(cold_sizes_));
   cold_sizes_count_ = 0;
-
-  if (!ColdFeatureActive()) {
-    std::copy(&class_array_[0], &class_array_[kClassArraySize],
-              &class_array_[kClassArraySize]);
-    return true;
-  }
-
-  // TODO(b/123523202): Systematically identify candidates for cold allocation
-  // and include them explicitly in size_classes.cc.
-  static constexpr size_t kColdCandidates[] = {
-      2048,  4096,  6144,  7168,  8192,   16384,
-      20480, 32768, 40960, 65536, 131072, 262144,
-  };
-  static_assert(ABSL_ARRAYSIZE(kColdCandidates) <= ABSL_ARRAYSIZE(cold_sizes_),
-                "kColdCandidates is too large.");
-
   // Point all lookups in the upper register of class_array_ (allocations
   // seeking cold memory) to the lower size classes.  This gives us an easy
   // fallback for sizes that are too small for moving to cold memory (due to
@@ -226,33 +278,19 @@ bool SizeMap::Init(absl::Span<const SizeClassInfo> size_classes) {
   std::copy(&class_array_[0], &class_array_[kClassArraySize],
             &class_array_[kClassArraySize]);
 
-  for (size_t max_size_in_class : kColdCandidates) {
-    ASSERT(max_size_in_class != 0);
-
-    // Find the size class.  Some of our kColdCandidates may not map to actual
-    // size classes in our current configuration.
-    bool found = false;
-    int c;
-    for (c = kExpandedClassesStart; c < kNumClasses; c++) {
-      if (class_to_size_[c] == max_size_in_class) {
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
+  for (int c = kExpandedClassesStart; c < kNumClasses; c++) {
+    size_t max_size_in_class = class_to_size_[c];
+    if (max_size_in_class == 0 || max_size_in_class < kMinAllocSizeForCold) {
+      // Resetting next_size to the last size class before
+      // kMinAllocSizeForCold + kAlignment.
+      next_size = max_size_in_class + static_cast<size_t>(kAlignment);
       continue;
     }
 
-    // Verify the candidate can fit into a single span's kCacheSize, otherwise,
-    // we use an intrusive freelist which triggers memory accesses.
-    if (Length(class_to_pages_[c]).in_bytes() / max_size_in_class >
-        Span::kCacheSize) {
-      continue;
-    }
-
+    TC_CHECK(Span::IsNonIntrusive(max_size_in_class), "size=%v",
+             max_size_in_class);
     cold_sizes_[cold_sizes_count_] = c;
-    cold_sizes_count_++;
+    ++cold_sizes_count_;
 
     for (int s = next_size; s <= max_size_in_class;
          s += static_cast<size_t>(kAlignment)) {
@@ -263,7 +301,6 @@ bool SizeMap::Init(absl::Span<const SizeClassInfo> size_classes) {
       break;
     }
   }
-
   return true;
 }
 

@@ -15,26 +15,48 @@
 #include "tcmalloc/cpu_cache.h"
 
 #include <stdlib.h>
-#include <string.h>
 
-#include <algorithm>
-#include <atomic>
+#include <cstdint>
+#include <new>
 
-#include "absl/base/dynamic_annotations.h"
-#include "absl/base/macros.h"
-#include "absl/base/thread_annotations.h"
-#include "absl/container/fixed_array.h"
-#include "tcmalloc/arena.h"
-#include "tcmalloc/common.h"
+#include "absl/base/attributes.h"
+#include "tcmalloc/internal/config.h"
+#include "tcmalloc/internal/environment.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/percpu.h"
 #include "tcmalloc/internal_malloc_extension.h"
 #include "tcmalloc/parameters.h"
 #include "tcmalloc/static_vars.h"
-#include "tcmalloc/transfer_cache.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
 namespace tcmalloc_internal {
+
+namespace cpu_cache_internal {
+ABSL_ATTRIBUTE_WEAK bool default_want_disable_wider_slabs();
+bool use_wider_slabs() {
+  // Disable wider slabs if built against an opt-out.
+  if (default_want_disable_wider_slabs != nullptr) {
+    return false;
+  }
+
+  const char* e = thread_safe_getenv("TCMALLOC_DISABLE_WIDER_SLABS");
+  if (e) {
+    switch (e[0]) {
+      case '0':
+        return true;
+      case '1':
+        return false;
+      default:
+        Crash(kCrash, __FILE__, __LINE__, "bad env var", e);
+        return false;
+    }
+  }
+
+  return true;
+}
+
+}  // namespace cpu_cache_internal
 
 static void ActivatePerCpuCaches() {
   if (tcmalloc::tcmalloc_internal::tc_globals.CpuCacheActive()) {

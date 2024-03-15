@@ -16,7 +16,14 @@
 
 #include <sys/mman.h>
 
+#include <cstddef>
+#include <cstdint>
+
+#include "absl/base/thread_annotations.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/config.h"
+#include "tcmalloc/internal/logging.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
 
@@ -60,6 +67,7 @@ void PageMap::MapRootWithSmallPages() {
   // so we will not end up forcing it to be small pages.
   if (rend > rbegin) {
     size_t rlength = rend - rbegin;
+    ErrnoRestorer errno_restorer;
     madvise(reinterpret_cast<void*>(rbegin), rlength, MADV_NOHUGEPAGE);
   }
 }

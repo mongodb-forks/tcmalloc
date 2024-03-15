@@ -14,33 +14,18 @@
 
 #include "tcmalloc/huge_page_aware_allocator.h"
 
-#include <stdint.h>
-#include <string.h>
-
-#include <new>
-
-#include "absl/base/internal/cycleclock.h"
-#include "absl/base/internal/spinlock.h"
-#include "absl/base/thread_annotations.h"
-#include "absl/time/time.h"
+#include "absl/base/attributes.h"
+#include "tcmalloc/arena.h"
 #include "tcmalloc/common.h"
-#include "tcmalloc/experiment.h"
-#include "tcmalloc/experiment_config.h"
-#include "tcmalloc/huge_allocator.h"
-#include "tcmalloc/huge_page_filler.h"
 #include "tcmalloc/huge_pages.h"
+#include "tcmalloc/huge_region.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/environment.h"
-#include "tcmalloc/internal/lifetime_predictions.h"
 #include "tcmalloc/internal/logging.h"
-#include "tcmalloc/internal/optimization.h"
-#include "tcmalloc/internal/prefetch.h"
-#include "tcmalloc/lifetime_based_allocator.h"
 #include "tcmalloc/pagemap.h"
-#include "tcmalloc/parameters.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
-#include "tcmalloc/stats.h"
-#include "tcmalloc/system-alloc.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
 namespace tcmalloc {
@@ -62,6 +47,12 @@ bool decide_subrelease() {
   if (e) {
     switch (e[0]) {
       case '0':
+        if (kUnconditionalHPAA) {
+          // If we're forcing HPAA on, we want to converge towards our default
+          // of subrelease on, rather than off (where it is moot without HPAA).
+          break;
+        }
+
         if (default_want_hpaa != nullptr) {
           int default_hpaa = default_want_hpaa();
           if (default_hpaa < 0) {
@@ -94,24 +85,46 @@ bool decide_subrelease() {
   return true;
 }
 
-LifetimePredictionOptions decide_lifetime_predictions() {
-  // See LifetimePredictionOptions::FromFlag for a description of the format.
-  const char* e = tcmalloc::tcmalloc_internal::thread_safe_getenv(
-      "TCMALLOC_LIFETIMES_CONTROL");
+extern "C" ABSL_ATTRIBUTE_WEAK bool
+default_want_disable_huge_region_more_often();
 
-  if (e != nullptr) {
-    return LifetimePredictionOptions::FromFlag(e);
+bool use_huge_region_more_often() {
+  // Disable huge regions more often feature if built against an opt-out.
+  if (default_want_disable_huge_region_more_often != nullptr) {
+    return false;
   }
 
-  return LifetimePredictionOptions::Default();
+  // TODO(b/296281171): Remove this opt-out.
+  const char* e =
+      thread_safe_getenv("TCMALLOC_USE_HUGE_REGION_MORE_OFTEN_DISABLE");
+  if (e) {
+    switch (e[0]) {
+      case '0':
+        return true;
+      case '1':
+        return false;
+      default:
+        Crash(kCrash, __FILE__, __LINE__, "bad env var", e);
+        return false;
+    }
+  }
+
+  return true;
 }
 
-HugeRegionCountOption use_huge_region_for_often() {
-  return (IsExperimentActive(
-              Experiment::TEST_ONLY_TCMALLOC_USE_HUGE_REGIONS_MORE_OFTEN) ||
-          IsExperimentActive(Experiment::TCMALLOC_USE_HUGE_REGIONS_MORE_OFTEN))
-             ? HugeRegionCountOption::kAbandonedCount
-             : HugeRegionCountOption::kSlack;
+HugeRegionUsageOption huge_region_option() {
+  // By default, we use slack to determine when to use HugeRegion. When slack is
+  // greater than 64MB (to ignore small binaries), and greater than the number
+  // of small allocations, we allocate large allocations from HugeRegion.
+  //
+  // When huge-region-more-often feature is enabled, we use number of abandoned
+  // pages in addition to slack to make a decision. If the size of abandoned
+  // pages plus slack exceeds 64MB (to ignore small binaries), we use HugeRegion
+  // for large allocations. This results in using HugeRegions for all the large
+  // allocations once the size exceeds 64MB.
+  return use_huge_region_more_often()
+             ? HugeRegionUsageOption::kUseForAllLargeAllocs
+             : HugeRegionUsageOption::kDefault;
 }
 
 Arena& StaticForwarder::arena() { return tc_globals.arena(); }

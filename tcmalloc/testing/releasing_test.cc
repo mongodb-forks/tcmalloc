@@ -25,6 +25,7 @@
 
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "benchmark/benchmark.h"
@@ -39,14 +40,14 @@ namespace {
 
 int64_t GetRSS() {
   tcmalloc::tcmalloc_internal::MemoryStats stats;
-  CHECK_CONDITION(tcmalloc::tcmalloc_internal::GetMemoryStats(&stats));
+  TC_CHECK(tcmalloc::tcmalloc_internal::GetMemoryStats(&stats));
   return stats.rss;
 }
 
 int64_t UnmappedBytes() {
-  absl::optional<size_t> value = tcmalloc::MallocExtension::GetNumericProperty(
+  std::optional<size_t> value = tcmalloc::MallocExtension::GetNumericProperty(
       "tcmalloc.pageheap_unmapped_bytes");
-  CHECK_CONDITION(value.has_value());
+  TC_CHECK(value.has_value());
   return *value;
 }
 

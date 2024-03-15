@@ -20,15 +20,22 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <type_traits>
 
+#include "absl/base/attributes.h"
+#include "absl/base/internal/sysinfo.h"
 #include "absl/base/optimization.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
+#include "tcmalloc/internal/allocation_guard.h"
 #include "tcmalloc/internal/config.h"
 
 //-------------------------------------------------------------------
@@ -115,10 +122,13 @@ class LogItem {
   LogItem(unsigned long v) : tag_(kUnsigned) { u_.unum = v; }
   LogItem(unsigned long long v) : tag_(kUnsigned) { u_.unum = v; }
   LogItem(const void* v) : tag_(kPtr) { u_.ptr = v; }
+  // Parameter is reference (against clang-tidy) to prevent pointing at a
+  // temporary (the by-value parameter), which causes a UaF error.
+  LogItem(const absl::string_view& v) : tag_(kStrView) { u_.ptr = &v; }
 
  private:
   friend class Logger;
-  enum Tag { kStr, kSigned, kUnsigned, kPtr, kEnd };
+  enum Tag { kStr, kStrView, kSigned, kUnsigned, kPtr, kEnd };
   Tag tag_;
   union {
     const char* str;
@@ -143,29 +153,139 @@ void Crash(CrashMode mode, const char* filename, int line, LogItem a,
            LogItem b = LogItem(), LogItem c = LogItem(), LogItem d = LogItem(),
            LogItem e = LogItem(), LogItem f = LogItem());
 
+ABSL_ATTRIBUTE_NORETURN void CheckFailed(const char* file, int line,
+                                         const char* msg, int msglen);
+
+template <typename... Args>
+ABSL_ATTRIBUTE_NORETURN ABSL_ATTRIBUTE_NOINLINE void CheckFailed(
+    const char* func, const char* file, int line,
+    const absl::FormatSpec<int, const char*, int, const char*, Args...>& format,
+    const Args&... args) {
+  AllocationGuard no_allocations;
+  char buf[512];
+  int n =
+      absl::SNPrintF(buf, sizeof(buf), format, absl::base_internal::GetTID(),
+                     file, line, func, args...);
+  buf[sizeof(buf) - 1] = 0;
+  CheckFailed(file, line, buf, std::min<size_t>(n, sizeof(buf) - 1));
+}
+
 // Tests can override this function to collect logging messages.
 extern void (*log_message_writer)(const char* msg, int length);
 
-// Like assert(), but executed even in NDEBUG mode
-#undef CHECK_CONDITION
-#define CHECK_CONDITION(cond)                                           \
+// Our own version of assert so we can avoid hanging by trying to do all kinds
+// of goofy printing while holding the malloc lock.
+#ifndef NDEBUG
+#define ASSERT(cond)                                                    \
   (ABSL_PREDICT_TRUE(cond) ? (void)0                                    \
                            : (::tcmalloc::tcmalloc_internal::Crash(     \
                                  ::tcmalloc::tcmalloc_internal::kCrash, \
                                  __FILE__, __LINE__, #cond)))
-
-// Our own version of assert() so we can avoid hanging by trying to do
-// all kinds of goofy printing while holding the malloc lock.
-#ifndef NDEBUG
-#define ASSERT(cond) CHECK_CONDITION(cond)
 #else
 #define ASSERT(cond) ((void)0)
 #endif
 
-// TODO(b/143069684): actually ensure no allocations in debug mode here.
-struct AllocationGuard {
-  AllocationGuard() {}
+// TC_BUG unconditionally aborts the program with the message.
+#define TC_BUG(msg, ...)                                                       \
+  tcmalloc::tcmalloc_internal::CheckFailed(__FUNCTION__, __FILE__, __LINE__,   \
+                                           "%d %s:%d: CHECK in %s: " msg "\n", \
+                                           ##__VA_ARGS__)
+
+// TC_CHECK* check the given condition in both debug and release builds,
+// and abort the program if the condition is false.
+// Macros accept an additional optional formatted message, for example:
+// TC_CHECK_EQ(a, b);
+// TC_CHECK_EQ(a, b, "ptr=%p flags=%d", ptr, flags);
+#define TC_CHECK(a, ...) TCMALLOC_CHECK_IMPL(a, #a, "" __VA_ARGS__)
+#define TC_CHECK_EQ(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), ==, (b), #a, #b, "" __VA_ARGS__)
+#define TC_CHECK_NE(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), !=, (b), #a, #b, "" __VA_ARGS__)
+#define TC_CHECK_LT(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), <, (b), #a, #b, "" __VA_ARGS__)
+#define TC_CHECK_LE(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), <=, (b), #a, #b, "" __VA_ARGS__)
+#define TC_CHECK_GT(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), >, (b), #a, #b, "" __VA_ARGS__)
+#define TC_CHECK_GE(a, b, ...) \
+  TCMALLOC_CHECK_OP((a), >=, (b), #a, #b, "" __VA_ARGS__)
+
+// TC_ASSERT* are debug-only versions of TC_CHECK*.
+#ifndef NDEBUG
+#define TC_ASSERT TC_CHECK
+#define TC_ASSERT_EQ TC_CHECK_EQ
+#define TC_ASSERT_NE TC_CHECK_NE
+#define TC_ASSERT_LT TC_CHECK_LT
+#define TC_ASSERT_LE TC_CHECK_LE
+#define TC_ASSERT_GT TC_CHECK_GT
+#define TC_ASSERT_GE TC_CHECK_GE
+#else  // #ifndef NDEBUG
+#define TC_ASSERT(a, ...) TC_CHECK(true || (a), ##__VA_ARGS__)
+#define TC_ASSERT_EQ(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#define TC_ASSERT_NE(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#define TC_ASSERT_LT(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#define TC_ASSERT_LE(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#define TC_ASSERT_GT(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#define TC_ASSERT_GE(a, b, ...) TC_ASSERT((a) == (b), ##__VA_ARGS__)
+#endif  // #ifndef NDEBUG
+
+#define TCMALLOC_CHECK_IMPL(condition, str, msg, ...)          \
+  ({                                                           \
+    ABSL_PREDICT_TRUE((condition))                             \
+    ? (void)0 : TC_BUG("%s (false) " msg, str, ##__VA_ARGS__); \
+  })
+
+#define TCMALLOC_CHECK_OP(c1, op, c2, cs1, cs2, msg, ...)                     \
+  ({                                                                          \
+    const auto& cc1 = (c1);                                                   \
+    const auto& cc2 = (c2);                                                   \
+    if (ABSL_PREDICT_FALSE(!(cc1 op cc2))) {                                  \
+      TC_BUG("%s " #op " %s (%v " #op " %v) " msg, cs1, cs2,                  \
+             tcmalloc::tcmalloc_internal::FormatConvert(cc1),                 \
+             tcmalloc::tcmalloc_internal::FormatConvert(cc2), ##__VA_ARGS__); \
+    }                                                                         \
+    (void)0;                                                                  \
+  })
+
+// absl::SNPrintF rejects to print pointers with %v,
+// so we need this little danse to convience it.
+struct PtrFormatter {
+  const volatile void* val;
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const PtrFormatter& p) {
+    absl::Format(&sink, "%p", p.val);
+  }
 };
+
+template <typename T>
+PtrFormatter FormatConvert(T* v) {
+  return PtrFormatter{v};
+}
+
+inline PtrFormatter FormatConvert(std::nullptr_t v) { return PtrFormatter{v}; }
+
+template <typename T>
+struct OptionalFormatter {
+  const T* val;
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const OptionalFormatter<T>& p) {
+    if (p.val != nullptr) {
+      absl::Format(&sink, "%v", *p.val);
+    } else {
+      absl::Format(&sink, "???");
+    }
+  }
+};
+
+template <typename T>
+OptionalFormatter<T> FormatConvert(const std::optional<T>& v) {
+  return {v.has_value() ? &*v : nullptr};
+}
+
+template <typename T>
+const T& FormatConvert(const T& v) {
+  return v;
+}
 
 // Print into buffer
 class Printer {
@@ -178,13 +298,13 @@ class Printer {
  public:
   // REQUIRES: "length > 0"
   Printer(char* buf, size_t length) : buf_(buf), left_(length), required_(0) {
-    ASSERT(length > 0);
+    TC_ASSERT_GT(length, 0);
     buf[0] = '\0';
   }
 
   template <typename... Args>
   void printf(const absl::FormatSpec<Args...>& format, const Args&... args) {
-    ASSERT(left_ >= 0);
+    TC_ASSERT_GE(left_, 0);
     if (left_ <= 0) {
       return;
     }
@@ -214,7 +334,7 @@ class Printer {
 
  private:
   void AppendPieces(std::initializer_list<absl::string_view> pieces) {
-    ASSERT(left_ >= 0);
+    TC_ASSERT_GE(left_, 0);
     if (left_ <= 0) {
       return;
     }
