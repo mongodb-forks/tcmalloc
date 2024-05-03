@@ -227,7 +227,7 @@ void GuardedPageAllocator::Deallocate(void* ptr) {
       const int kBufferSize = 64 << 10;
       char* buffer = new char[kBufferSize];
       Printer printer(buffer, kBufferSize);
-      DumpStats(&printer, level);
+      DumpStats(&printer, 2);
       (void)write(STDERR_FILENO, buffer, strlen(buffer));
       delete[] buffer;
     }
