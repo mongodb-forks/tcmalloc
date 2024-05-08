@@ -930,7 +930,7 @@ alloc_small_sampled_hooks_or_perthread(size_t size, size_t size_class,
                                tc_globals.sizemap().class_to_size(size_class)};
   if (ABSL_PREDICT_FALSE(weight != 0)) {
     ptr = SampleSmallAllocation(tc_globals, policy, size, weight, size_class,
-                                ptr);                 
+                                ptr);
   }
   if (Policy::invoke_hooks()) {
   }
