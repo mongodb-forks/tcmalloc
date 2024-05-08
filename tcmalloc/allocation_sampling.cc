@@ -218,7 +218,7 @@ sized_ptr_t SampleifyAllocation(Static& state, size_t requested_size,
   TC_ASSERT_NE(span, nullptr);
   
   // Mongo check: the span cannot be inside the GuardedPageAllocator, because we do not enable it.
-  TC_CHECK(!tc_globals.guarded_page_allocator().PointerIsMine(span->start_address()));
+  TC_CHECK(!tc_globals.guardedpage_allocator().PointerIsMine(span->start_address()));
 
   stack_trace.sampled_alloc_handle =
       state.sampled_alloc_handle_generator.fetch_add(
