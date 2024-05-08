@@ -921,10 +921,8 @@ alloc_small_sampled_hooks_or_perthread(size_t size, size_t size_class,
       (res = tc_globals.cpu_cache().AllocateFast(size_class)) == nullptr) {
     if (UsePerCpuCache(tc_globals)) {
       res = tc_globals.cpu_cache().AllocateSlow(size_class);
-      TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(res));
     } else {
       res = ThreadCache::GetCache()->Allocate(size_class);
-      TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(res));
     }
     if (ABSL_PREDICT_FALSE(res == nullptr)) return policy.handle_oom(size);
   }
@@ -932,10 +930,12 @@ alloc_small_sampled_hooks_or_perthread(size_t size, size_t size_class,
                                tc_globals.sizemap().class_to_size(size_class)};
   if (ABSL_PREDICT_FALSE(weight != 0)) {
     ptr = SampleSmallAllocation(tc_globals, policy, size, weight, size_class,
-                                ptr);
+                                ptr);                 
   }
   if (Policy::invoke_hooks()) {
   }
+  // Mongo check: pointer cannot be inside the GuardedPageAllocator, because we do not enable it.
+  TC_CHECK(!tc_globals.guarded_page_allocator().PointerIsMine(ptr.p));     
   return Policy::as_pointer(ptr.p, ptr.n);
 }
 
@@ -962,7 +962,6 @@ slow_alloc_small(size_t size, uint32_t size_class, Policy policy) {
 
   void* res = tc_globals.cpu_cache().AllocateSlowNoHooks(size_class);
   if (ABSL_PREDICT_FALSE(res == nullptr)) return policy.handle_oom(size);
-  TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(res));
   return Policy::to_pointer(res, size_class);
 }
 
@@ -975,7 +974,6 @@ ABSL_ATTRIBUTE_NOINLINE static typename Policy::pointer_type slow_alloc_large(
 
   if (Policy::invoke_hooks()) {
   }
-  TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(res.p));
   return Policy::as_pointer(res.p, res.n);
 }
 
@@ -1017,7 +1015,6 @@ static inline Pointer ABSL_ATTRIBUTE_ALWAYS_INLINE fast_alloc(Policy policy,
   }
 
   TC_ASSERT_NE(ret, nullptr);
-  TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(ret));
   return Policy::to_pointer(ret, size_class);
 }
 
