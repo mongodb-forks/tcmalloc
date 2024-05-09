@@ -935,7 +935,7 @@ alloc_small_sampled_hooks_or_perthread(size_t size, size_t size_class,
   if (Policy::invoke_hooks()) {
   }
   // Mongo check: pointer cannot be inside the GuardedPageAllocator, because we do not enable it.
-  TC_CHECK(!tc_globals.guardedpage_allocator().PointerIsMine(ptr.p));     
+  TC_ASSERT(!tc_globals.guardedpage_allocator().PointerIsMine(ptr.p));     
   return Policy::as_pointer(ptr.p, ptr.n);
 }
 
